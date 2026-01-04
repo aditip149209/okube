@@ -1,0 +1,49 @@
+# --- Build Artifacts ---
+# Ignore the specific binary names for your project
+# (Replace 'cube' or 'orchestrator' with whatever you name your output)
+okube
+orchestrator
+main
+
+# Ignore all executables (Mac/Linux/Windows)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Output of 'go test -c'
+*.test
+
+# Output of 'go coverage'
+*.out
+coverage.txt
+profile.out
+
+# --- Directories ---
+# If you compile binaries into a specific folder
+bin/
+dist/
+
+# --- Dependency Management ---
+# Vendor directory is usually ignored unless you specifically want to 
+# commit dependencies to your repo (most modern projects use go modules only)
+vendor/
+
+# Go Workspace files (if you use local workspaces)
+go.work
+go.work.sum
+
+# --- IDE & Editor Settings ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+
+# --- Security ---
+# NEVER commit your secrets!
+.env
