@@ -3,8 +3,10 @@ module github.com/aditip149209/okube
 go 1.25.3
 
 require (
+	github.com/c9s/goprocinfo v0.0.0-20210130143923-c95fcf8c64a8
 	github.com/docker/docker v0.0.0-00010101000000-000000000000
 	github.com/docker/go-connections v0.6.0
+	github.com/go-chi/chi v1.5.5
 	github.com/golang-collections/collections v0.0.0-20130729185459-604e922904d3
 	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.10.2

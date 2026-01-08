@@ -225,3 +225,8 @@ For issues, questions, or contributions, please open an issue on the [GitHub rep
 ---
 
 **Note**: This is an educational project and is not recommended for production use. For production container orchestration, consider using Kubernetes, Docker Swarm, or other mature platforms.
+
+
+<!-- 
+todo: cloud provider interface, multiple managers using raft, network aware capabilities, custom network aware scheduler plugin for kubernetes to be donated -->
+

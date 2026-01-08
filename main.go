@@ -2,123 +2,145 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"time"
 
-	"github.com/aditip149209/okube/pkg/manager"
-	"github.com/aditip149209/okube/pkg/node"
 	"github.com/aditip149209/okube/pkg/task"
 	"github.com/aditip149209/okube/pkg/worker"
-	"github.com/docker/docker/client"
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
 )
 
+func runTasks(w *worker.Worker) {
+	for {
+		if w.Queue.Len() != 0 {
+			result := w.RunTask()
+			if result.Error != nil {
+				log.Printf("Error running task: %v\n", result.Error)
+			}
+		} else {
+			log.Printf("No tasks to process currently\n")
+		}
+		log.Println("Sleeping for 10 seconds")
+		time.Sleep(time.Second * 10)
+	}
+}
+
 func main() {
-	t := task.Task{
-		ID:     uuid.New(),
-		Name:   "Task-1",
-		State:  task.Pending,
-		Image:  "Image-1",
-		Memory: 1024,
-		Disk:   1,
-	}
 
-	te := task.TaskEvent{
-		ID:        uuid.New(),
-		State:     task.Pending,
-		Timestamp: time.Now(),
-		Task:      t,
-	}
+	host := os.Getenv("CUBE_HOST")
+	port := 3002
 
-	fmt.Printf("Task: %v\n", t)
-	fmt.Printf("Task event: %v\n", te)
+	fmt.Println("Starting Cube worker")
 
 	w := worker.Worker{
-		Name:  "Worker-1",
 		Queue: *queue.New(),
 		Db:    make(map[uuid.UUID]*task.Task),
 	}
 
-	fmt.Printf("Worker: %v\n", w)
-	w.CollectStats()
-	w.RunTask()
-	w.StartTask()
-	w.StopTask()
+	api := worker.Api{Address: host, Port: port, Worker: &w}
 
-	m := manager.Manager{
-		Pending: *queue.New(),
-		TaskDB:  make(map[string][]*task.Task),
-		EventDB: make(map[string][]*task.TaskEvent),
-		Workers: []string{w.Name},
-	}
+	go runTasks(&w)
+	go w.CollectStats()
+	api.Start()
 
-	fmt.Printf("The manager: %v\n", m)
-	m.SelectWorker()
-	m.UpdateTasks()
-	m.SendWork()
+	// db := make(map[uuid.UUID]*task.Task)
+	// w1 := worker.Worker{
+	// 	Queue: *queue.New(),
+	// 	Db:    db,
+	// }
 
-	n := node.Node{
-		Name:   "Node-1",
-		Ip:     "192.168.1.1",
-		Cores:  4,
-		Memory: 1024,
-		Disk:   25,
-		Role:   "worker",
-	}
+	// t1 := task.Task{
+	// 	ID:    uuid.New(),
+	// 	Name:  "test-container-1",
+	// 	State: task.Scheduled,
+	// 	Image: "strm/helloworld-http",
+	// }
 
-	fmt.Printf("Node: %v\n", n)
+	// w2 := worker.Worker{
+	// 	Queue: *queue.New(),
+	// 	Db:    db,
+	// }
 
-	fmt.Printf("Creating a test container\n")
-	dockerTask, createResult := createContainer()
-	if createResult.Error != nil {
-		fmt.Printf("%v", createResult.Error)
-		os.Exit(1)
-	}
+	// t2 := task.Task{
+	// 	ID:    uuid.New(),
+	// 	Name:  "test-container2",
+	// 	State: task.Scheduled,
+	// 	Image: "strm/helloworld-http",
+	// }
 
-	time.Sleep(time.Second * 5)
-	fmt.Printf("Stopping container %s\n", createResult.ContainerId)
-	_ = stopContainer(dockerTask, createResult.ContainerId)
+	// fmt.Println("starting task")
 
-}
+	// w2.AddTask(t2)
+	// w1.AddTask(t1)
 
-func createContainer() (*task.Docker, *task.DockerResult) {
-	c := task.Config{
-		Name:  "test-container-1",
-		Image: "postgres:13",
-		Env: []string{
-			"POSTGRES_USER=cube",
-			"POSTGRES_PASSWORD=secret",
-		},
-	}
+	// res1 := w1.RunTask()
+	// if res1.Error != nil {
+	// 	panic(res1.Error)
+	// }
 
-	dc, _ := client.NewClientWithOpts(client.FromEnv)
-	d := task.Docker{
-		Client: dc,
-		Config: c,
-	}
+	// fmt.Printf("Task %s is running in container %s\n", t1.ID, t1.ContainerID)
+	// fmt.Println("Sleepy time")
+	// time.Sleep(time.Second * 3)
 
-	result := d.Run()
-	if result.Error != nil {
-		fmt.Printf("%v\n", result.Error)
-		return nil, nil
-	}
+	// fmt.Printf("stopping task %s\n", t1.ID)
+	// t1.State = task.Completed
+	// w1.AddTask(t1)
+	// res1 = w1.RunTask()
 
-	fmt.Printf(
-		"Container %s is running with config %v\n", result.ContainerId, c,
-	)
+	// // w2.AddTask(t1)
 
-	return &d, &result
-}
-
-func stopContainer(d *task.Docker, id string) *task.DockerResult {
-	result := d.Stop(id)
-	if result.Error != nil {
-		fmt.Printf("%v\n", result.Error)
-		return nil
-	}
-
-	fmt.Printf("Container %s has been stopped and removed\n", result.ContainerId)
-	return &result
+	// res2 := w2.RunTask()
+	// fmt.Println("print sth")
+	// t2.State = task.Completed
+	// w2.AddTask(t2)
+	// res2 = w2.RunTask()
+	// if res2.Error != nil {
+	// 	panic(res2.Error)
+	// } else {
+	// 	fmt.Printf("all tasks ended yay")
+	// }
 
 }
+
+// func createContainer() (*task.Docker, *task.DockerResult) {
+// 	c := task.Config{
+// 		Name:  "test-container-1",
+// 		Image: "postgres:13",
+// 		Env: []string{
+// 			"POSTGRES_USER=cube",
+// 			"POSTGRES_PASSWORD=secret",
+// 		},
+// 	}
+
+// 	dc, _ := client.NewClientWithOpts(client.FromEnv)
+// 	d := task.Docker{
+// 		Client: dc,
+// 		Config: c,
+// 	}
+
+// 	result := d.Run()
+// 	if result.Error != nil {
+// 		fmt.Printf("%v\n", result.Error)
+// 		return nil, nil
+// 	}
+
+// 	fmt.Printf(
+// 		"Container %s is running with config %v\n", result.ContainerId, c,
+// 	)
+
+// 	return &d, &result
+// }
+
+// func stopContainer(d *task.Docker, id string) *task.DockerResult {
+// 	result := d.Stop(id)
+// 	if result.Error != nil {
+// 		fmt.Printf("%v\n", result.Error)
+// 		return nil
+// 	}
+
+// 	fmt.Printf("Container %s has been stopped and removed\n", result.ContainerId)
+// 	return &result
+
+// }

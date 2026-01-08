@@ -26,6 +26,14 @@ const (
 	Failed
 )
 
+var stateTransitionMap = map[State][]State{
+	Pending:   []State{Scheduled},
+	Scheduled: []State{Scheduled, Running, Failed},
+	Running:   []State{Running, Completed, Failed},
+	Completed: []State{},
+	Failed:    []State{},
+}
+
 type Task struct {
 	ID            uuid.UUID
 	Name          string
@@ -33,6 +41,7 @@ type Task struct {
 	Image         string
 	Memory        int
 	Disk          int
+	ContainerID   string
 	ExposedPorts  nat.PortSet
 	PortBindings  map[string]string
 	RestartPolicy string
@@ -62,9 +71,31 @@ type Config struct {
 	RestartPolicy string
 }
 
+func NewConfig(t *Task) *Config {
+	return &Config{
+		Name:          t.Name,
+		Image:         t.Image,
+		Memory:        int64(t.Memory),
+		Disk:          int64(t.Disk),
+		RestartPolicy: t.RestartPolicy,
+		ExposedPorts:  t.ExposedPorts,
+	}
+}
+
 type Docker struct {
 	Client *client.Client
 	Config Config
+}
+
+func NewDocker(c *Config) *Docker {
+	cli, _ := client.NewClientWithOpts(client.FromEnv)
+	ctx := context.Background()
+	cli.NegotiateAPIVersion(ctx)
+
+	return &Docker{
+		Client: cli,
+		Config: *c,
+	}
 }
 
 type DockerResult struct {
