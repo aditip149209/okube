@@ -57,6 +57,8 @@ func main() {
 
 	go m.ProcessTasks()
 	go m.UpdateTasks()
+	go m.DoHealthChecks()
+
 	go mapi.Start()
 
 	for i := 0; i < 3; i++ {
