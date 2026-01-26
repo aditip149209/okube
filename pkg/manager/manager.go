@@ -3,13 +3,16 @@ package manager
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aditip149209/okube/pkg/task"
 	"github.com/aditip149209/okube/pkg/worker"
+	"github.com/docker/go-connections/nat"
 	"github.com/go-chi/chi"
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
@@ -40,15 +43,16 @@ func (m *Manager) SelectWorker() string {
 	return m.Workers[newWorker]
 }
 
-func (m *Manager) UpdateTasks() {
+func (m *Manager) updateTasks() {
 	for _, worker := range m.Workers {
 		log.Printf("Checking worker %v for task updates", worker)
-		url := fmt.Sprintf("http://%tasks", worker)
+		url := fmt.Sprintf("http://%s/tasks", worker)
 		resp, err := http.Get(url)
 		if err != nil {
 			log.Printf("Error connecting to %v: %v\n", worker, err)
 
 		}
+		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			log.Printf("Error sending request: %v\n", err)
@@ -205,7 +209,7 @@ func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 
 func (a *Api) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader()
+	w.WriteHeader(200)
 	json.NewEncoder(w).Encode(a.Manager.GetTasks())
 }
 
@@ -226,8 +230,8 @@ func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	te := task.TaskEvent{
-		ID: uuid.New()
-		State: task.Completed,
+		ID:        uuid.New(),
+		State:     task.Completed,
 		Timestamp: time.Now(),
 	}
 
@@ -254,7 +258,7 @@ func (a *Api) initRouter() {
 	a.Router.Route("/tasks", func(r chi.Router) {
 		r.Post("/", a.StartTaskHandler)
 		r.Get("/", a.GetTasksHandler)
-		r.Route("/{taskID}", func(r chi.Router){
+		r.Route("/{taskID}", func(r chi.Router) {
 			r.Delete("/", a.StopTaskHandler)
 		})
 	})
@@ -265,4 +269,91 @@ func (a *Api) Start() {
 	http.ListenAndServe(fmt.Sprintf("%s:%d", a.Address, a.Port), a.Router)
 }
 
+func (m *Manager) UpdateTasks() {
+	for {
+		log.Println("Checking for task updates from workers")
+		m.updateTasks()
+		log.Println("Tasks update completed")
+		log.Println("Sleeping for 15 seconds")
+		time.Sleep(15 * time.Second)
+	}
+}
 
+func (m *Manager) ProcessTasks() {
+	for {
+		log.Println("Processing any tasks in the queue")
+		m.SendWork()
+		log.Printf("Sleeping for 10 seconds")
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func (m *Manager) getHostPort(ports nat.PortMap) *string {
+	for k, _ := range ports {
+		return &ports[k][0].HostPort
+	}
+
+	return nil
+}
+
+func (m *Manager) checkTaskHealth(t task.Task) error {
+	log.Printf("Calling health check for task %s: %s\n", t.ID, t.HealthCheck)
+
+	w := m.TaskWorkersMap[t.ID]
+
+	hostPort := m.getHostPort(t.HostPorts)
+	worker := strings.Split(w, ":")
+	url := fmt.Sprintf("http://%s:%s%s", worker[0], *hostPort, t.HealthCheck)
+
+	log.Printf("Calling health check for task %s: %s\n", t.ID, url)
+
+	resp, err := http.Get(url)
+
+	if err != nil {
+		msg := fmt.Sprintf("Error connecting to health check %s", url)
+		log.Println(msg)
+		return errors.New(msg)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		msg := fmt.Sprintf("Error health check for task %s did not return 200\n", t.ID)
+		log.Println(msg)
+		return errors.New(msg)
+	}
+
+	log.Printf("Task %s health check response: %v\n", t.ID, resp.StatusCode)
+
+	return nil
+
+}
+
+func (m *Manager) doHealthChecks() {
+	for _, t := range m.GetTasks() {
+		if t.State == task.Running && t.RestartCount < 3 {
+			err := m.checkTaskHealth(*t)
+			if err != nil {
+				if t.RestartCount < 3 {
+					m.restartTask(t)
+				}
+			}
+		} else if t.State == task.Failed && t.RestartCount < 3 {
+			m.restartTask(t)
+		}
+	}
+}
+
+
+func (m *Manager) restartTask(t *task.Task) {
+	w := m.TaskWorkersMap[t.ID]
+	t.State = task.Scheduled
+	t.RestartCount++
+
+	m.TaskDB[t.ID] = t
+
+	te := task.TaskEvent{
+		ID: uuid.New(),
+		State: task.Running,
+		Timestamp: time.Now(),
+		Task: *t
+	}
+}

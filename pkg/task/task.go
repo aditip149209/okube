@@ -47,6 +47,12 @@ type Task struct {
 	RestartPolicy string
 	StartTime     time.Time
 	EndTime       time.Time
+	HostPorts     nat.PortMap
+	HealthCheck   string //the task defines how the health check is done, this will be a url, which the manager will call, if it returns 200 then that means the health check was successful.
+	// question is - how reliable is this url, i.e. will this really tell us if this task is healthy or not?
+	//if the developer wrote a bad health check, then our manager will not make good decisions
+	//the manager relies completely on the url, and the url is only as smart as the dev who wrote it.
+	RestartCount int
 }
 
 type TaskEvent struct {
@@ -85,6 +91,22 @@ func NewConfig(t *Task) *Config {
 type Docker struct {
 	Client *client.Client
 	Config Config
+}
+
+type DockerInspectResponse struct {
+	Error     error
+	Container *types.ContainerJSON
+}
+
+func (d *Docker) Inspect(containerID string) DockerInspectResponse {
+	dc, _ := client.NewClientWithOpts(client.FromEnv)
+	ctx := context.Background()
+	resp, err := dc.ContainerInspect(ctx, containerID)
+	if err != nil {
+		log.Printf("Error inspecting container: %s\n", err)
+		return DockerInspectResponse{Error: err}
+	}
+	return DockerInspectResponse{Container: &resp}
 }
 
 func NewDocker(c *Config) *Docker {
