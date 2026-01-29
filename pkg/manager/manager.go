@@ -110,7 +110,11 @@ func (m *Manager) SendWork() {
 			log.Printf("Unable to marshal task object")
 		}
 
-		url := fmt.Sprintf("http://%s/tasks", w)
+		m.WorkersTaskMap[w.Name] = append(m.WorkersTaskMap[w.Name], te.Task.ID)
+		m.TaskWorkersMap[t.ID] = w.Name
+
+		url := fmt.Sprintf("http://%v/tasks", w.Name)
+
 		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 		if err != nil {
 			log.Printf("Error connecting to %v: %v\n", w, err)
@@ -206,7 +210,7 @@ func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		msg := fmt.Sprintf("Error unmarshalling body: %v\n", err)
-		log.Printf(msg)
+		log.Print(msg)
 		w.WriteHeader(400)
 		e := ErrResponse{
 			HTTPStatusCode: 400,

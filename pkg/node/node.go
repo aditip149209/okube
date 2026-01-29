@@ -16,3 +16,42 @@ type Node struct {
 	Role            string
 	TaskCount       int
 }
+
+type Option func(*Node)
+
+func WithCore(c int) Option {
+	return func(n *Node) {
+		n.Cores = c
+	}
+}
+
+func WithMemory(m int) Option {
+	return func(n *Node) {
+		n.Memory = m
+	}
+}
+
+func WithDisk(d int) Option {
+	return func(n *Node) {
+		n.Disk = d
+	}
+}
+
+// NewNode creates and returns a new Node instance
+func NewNode(name string, ip string, role string, opts ...Option) *Node {
+
+	n := &Node{
+		Name:            name,
+		Ip:              ip,
+		MemoryAllocated: 0,
+		DiskAllocated:   0,
+		Role:            role,
+		TaskCount:       0,
+	}
+
+	for _, opt := range opts {
+		opt(n)
+	}
+
+	return n
+}
