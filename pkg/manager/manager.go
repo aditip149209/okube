@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aditip149209/okube/pkg/node"
+	"github.com/aditip149209/okube/pkg/scheduler"
 	"github.com/aditip149209/okube/pkg/task"
 	"github.com/aditip149209/okube/pkg/worker"
 	"github.com/docker/go-connections/nat"
@@ -26,21 +28,24 @@ type Manager struct {
 	WorkersTaskMap map[string][]uuid.UUID
 	TaskWorkersMap map[uuid.UUID]string
 	LastWorker     int
+	WorkerNodes    []*node.Node
+	Scheduler      scheduler.Scheduler
 }
 
-func (m *Manager) SelectWorker() string {
-	// this will act as scheduler for now
-	// naive round robin
-	var newWorker int
-	if m.LastWorker+1 < len(m.Workers) {
-		newWorker = m.LastWorker + 1
-		m.LastWorker++
-	} else {
-		newWorker = 0
-		m.LastWorker = 0
+func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
+	candidates := m.Scheduler.SelectCandidateNodes(t, m.WorkerNodes)
+	if candidates == nil {
+		msg := fmt.Sprintf("No available candidates match resource request for task %v", t.ID)
+		err := errors.New(msg)
+		return nil, err
+
 	}
 
-	return m.Workers[newWorker]
+	scores := m.Scheduler.Score(t, candidates)
+	selectedNode := m.Scheduler.Pick(scores, candidates)
+
+	return selectedNode, nil
+
 }
 
 func (m *Manager) updateTasks() {
@@ -87,22 +92,17 @@ func (m *Manager) updateTasks() {
 
 func (m *Manager) SendWork() {
 	if m.Pending.Len() > 0 {
-		w := m.SelectWorker()
-
 		e := m.Pending.Dequeue()
-
 		te := e.(task.TaskEvent)
+		m.EventDB[te.ID] = &te
+		log.Printf("Pulled task %v off the managers queue", te)
 
 		t := te.Task
-		log.Printf("Pulled %v off pending queue\n", t)
+		w, err := m.SelectWorker(t)
 
-		m.EventDB[te.ID] = &te
-		m.WorkersTaskMap[w] = append(m.WorkersTaskMap[w], te.Task.ID)
-		m.TaskWorkersMap[t.ID] = w
-
-		t.State = task.Scheduled
-
-		m.TaskDB[t.ID] = &t
+		if err != nil {
+			log.Printf("Error selecting worker for task %v: %v", t, err)
+		}
 
 		data, err := json.Marshal(te)
 
@@ -148,14 +148,27 @@ func (m *Manager) AddTask(te task.TaskEvent) {
 	m.Pending.Enqueue(te)
 }
 
-func New(workers []string) *Manager {
+func New(workers []string, schedulerType string) *Manager {
 	TaskDB := make(map[uuid.UUID]*task.Task)
 	EventDB := make(map[uuid.UUID]*task.TaskEvent)
 	WorkerTaskMap := make(map[string][]uuid.UUID)
 	TaskWorkerMap := make(map[uuid.UUID]string)
 
+	var nodes []*node.Node
+
 	for worker := range workers {
 		WorkerTaskMap[workers[worker]] = []uuid.UUID{}
+		nAPI := fmt.Sprintf("http://%v", workers[worker])
+		n := node.NewNode(workers[worker], nAPI, "worker")
+		nodes = append(nodes, n)
+	}
+
+	var s scheduler.Scheduler
+	switch schedulerType {
+	case "roundrobin":
+		s = &scheduler.RoundRobin{Name: "roundrobin"}
+	default:
+		s = &scheduler.RoundRobin{Name: "roundrobin"}
 	}
 
 	return &Manager{
@@ -165,6 +178,8 @@ func New(workers []string) *Manager {
 		EventDB:        EventDB,
 		WorkersTaskMap: WorkerTaskMap,
 		TaskWorkersMap: TaskWorkerMap,
+		WorkerNodes:    nodes,
+		Scheduler:      s,
 	}
 }
 

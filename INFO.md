@@ -188,3 +188,17 @@ This is a specific state used to signal to the human administrator that "This is
 Summary for your Okube Project
 
 If you want to upgrade your logic from "Toy" to "Pro," implement Exponential Backoff with a Cap.
+
+
+An orchestration system can automate the process of
+recovering from task failures up to a certain point. Past a certain
+point, however, the best it can do is provide useful debugging
+information that helps administrators and application owners
+troubleshoot the problem further. (Note that we did not do this
+for our orchestration system. If you’re curious, you can try to
+implement something like task logging.)--- we could explore how to implement this, and how modern systems like k8s implements this. 
+
+
+currently- we are implementing a round robin scheduler and e pvm scheduler for our scheduler interface. we will be extending this to support network aware capabilities, we need to do additional research on improving existing network aware plugins. additionally, for the storage part, we will be using etcd, instead of bolt db, to support multiple managers. 
+
+we can also improve already existing network schedulers, create a plugin that can be donated to kubernetes. 
