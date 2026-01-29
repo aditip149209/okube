@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/aditip149209/okube/pkg/manager"
 	"github.com/aditip149209/okube/pkg/task"
@@ -37,22 +37,45 @@ func main() {
 	}
 	mport, _ := strconv.Atoi(mportStr)
 
-	fmt.Println("Starting Cube worker")
+	fmt.Println("Starting Cube workers")
 
-	w := worker.Worker{
+	w1 := worker.Worker{
 		Queue: *queue.New(),
 		Db:    make(map[uuid.UUID]*task.Task),
 	}
+	wapi1 := worker.Api{Address: whost, Port: wport, Worker: &w1}
 
-	wapi := worker.Api{Address: whost, Port: wport, Worker: &w}
+	w2 := worker.Worker{
+		Queue: *queue.New(),
+		Db:    make(map[uuid.UUID]*task.Task),
+	}
+	wapi2 := worker.Api{Address: whost, Port: wport + 1, Worker: &w2}
 
-	go w.RunTasks()
-	go w.CollectStats()
-	go wapi.Start()
+	w3 := worker.Worker{
+		Queue: *queue.New(),
+		Db:    make(map[uuid.UUID]*task.Task),
+	}
+	wapi3 := worker.Api{Address: whost, Port: wport + 2, Worker: &w3}
 
-	workers := []string{fmt.Sprintf("%v:%v", whost, wport)}
-	m := manager.New(workers)
+	go w1.RunTasks()
+	go w1.UpdateTasks()
+	go wapi1.Start()
 
+	go w2.RunTasks()
+	go w2.UpdateTasks()
+	go wapi2.Start()
+
+	go w3.RunTasks()
+	go w3.UpdateTasks()
+	go wapi3.Start()
+
+	workers := []string{
+		fmt.Sprintf("%s:%d", whost, wport),
+		fmt.Sprintf("%s:%d", whost, wport+1),
+		fmt.Sprintf("%s:%d", whost, wport+2),
+	}
+
+	m := manager.New(workers, "roundrobin")
 	mapi := manager.Api{Address: mhost, Port: mport, Manager: m}
 
 	go m.ProcessTasks()
@@ -60,6 +83,8 @@ func main() {
 	go m.DoHealthChecks()
 
 	go mapi.Start()
+
+	log.Printf("This the manager %v", m)
 
 	for i := 0; i < 3; i++ {
 		t := task.Task{
@@ -74,21 +99,9 @@ func main() {
 			Task:  t,
 		}
 		m.AddTask(te)
-		m.SendWork()
 	}
 
-	go func() {
-		for {
-			m.UpdateTasks()
-			time.Sleep(15 * time.Second)
-		}
-	}()
-
-	for {
-		for _, t := range m.TaskDB {
-			fmt.Printf("[Manager] Task: id: %s, state: %d\n", t.ID, t.State)
-		}
-		time.Sleep(10 * time.Second)
-	}
+	// Keep main goroutine alive
+	select {}
 
 }
