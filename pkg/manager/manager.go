@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"github.com/aditip149209/okube/pkg/node"
 	"github.com/aditip149209/okube/pkg/scheduler"
 	"github.com/aditip149209/okube/pkg/task"
-	"github.com/aditip149209/okube/pkg/worker"
 	"github.com/docker/go-connections/nat"
 	"github.com/go-chi/chi"
 	"github.com/golang-collections/collections/queue"
@@ -30,6 +28,7 @@ type Manager struct {
 	LastWorker     int
 	WorkerNodes    []*node.Node
 	Scheduler      scheduler.Scheduler
+	WorkerClient   WorkerCommunicator
 }
 
 func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
@@ -51,23 +50,9 @@ func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
 func (m *Manager) updateTasks() {
 	for _, worker := range m.Workers {
 		log.Printf("Checking worker %v for task updates", worker)
-		url := fmt.Sprintf("http://%s/tasks", worker)
-		resp, err := http.Get(url)
+		tasks, err := m.WorkerClient.FetchTasks(worker)
 		if err != nil {
 			log.Printf("Error connecting to %v: %v\n", worker, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Error sending request: %v\n", err)
-		}
-
-		d := json.NewDecoder(resp.Body)
-		var tasks []*task.Task
-		err = d.Decode(&tasks)
-		if err != nil {
-			log.Printf("Error unmarshalling tasks: %s\n", err.Error())
 		}
 
 		for _, t := range tasks {
@@ -130,44 +115,22 @@ func (m *Manager) SendWork() {
 		m.WorkersTaskMap[w.Name] = append(m.WorkersTaskMap[w.Name], te.Task.ID)
 		m.TaskWorkersMap[t.ID] = w.Name
 
-		url := fmt.Sprintf("http://%v/tasks", w.Name)
-
-		data, err := json.Marshal(te)
-
-		if err != nil {
-			log.Printf("Unable to marshal task object")
-		}
-
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+		newTask, errResp, err := m.WorkerClient.StartTask(w.Name, te)
 		if err != nil {
 			log.Printf("Error connecting to %v: %v\n", w, err)
 			m.Pending.Enqueue(te)
 			return
 		}
 
-		d := json.NewDecoder(resp.Body)
-		if resp.StatusCode != http.StatusCreated {
-			e := worker.ErrResponse{}
-			err := d.Decode(&e)
-			if err != nil {
-				fmt.Printf("Error decoding response: %s\n", err.Error())
-				return
-			}
-
-			log.Printf("Response error (%d): %s", e.HTTPStatusCode, e.Message)
+		if errResp != nil {
+			log.Printf("Response error (%d): %s", errResp.HTTPStatusCode, errResp.Message)
 			return
 		}
 
-		t = task.Task{}
-		err = d.Decode(&t)
-		if err != nil {
-			fmt.Printf("Error decoding response: %s\n", err.Error())
-			return
+		if newTask != nil {
+			m.TaskDB[newTask.ID] = newTask
+			log.Printf("%#v\n", *newTask)
 		}
-
-		m.TaskDB[t.ID] = &t
-
-		log.Printf("%#v\n", t)
 
 	} else {
 		log.Println("No work in the queue")
@@ -210,6 +173,7 @@ func New(workers []string, schedulerType string) *Manager {
 		TaskWorkersMap: TaskWorkerMap,
 		WorkerNodes:    nodes,
 		Scheduler:      s,
+		WorkerClient:  NewHTTPWorkerClient(nil),
 	}
 }
 
@@ -401,39 +365,15 @@ func (m *Manager) restartTask(t *task.Task) {
 		Task:      *t,
 	}
 
-	data, err := json.Marshal(te)
-
-	if err != nil {
-		log.Printf("Unable to marshal task object: %v", t)
-		return
-	}
-
-	url := fmt.Sprintf("http://%s/tasks", w)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+	_, errResp, err := m.WorkerClient.StartTask(w, te)
 	if err != nil {
 		log.Printf("Error connecting to %v: %v", w, err)
 		m.Pending.Enqueue(t)
 		return
 	}
 
-	d := json.NewDecoder(resp.Body)
-	if resp.StatusCode != http.StatusCreated {
-		e := worker.ErrResponse{}
-		err := d.Decode(&e)
-
-		if err != nil {
-			fmt.Printf("Error decoding response: %s\n", err.Error())
-			return
-		}
-
-		log.Printf("Response error (%d): %s", e.HTTPStatusCode, e.Message)
-		return
-	}
-
-	newTask := task.Task{}
-	err = d.Decode(&newTask)
-	if err != nil {
-		fmt.Printf("Error decoding response: %s\n", err.Error())
+	if errResp != nil {
+		log.Printf("Response error (%d): %s", errResp.HTTPStatusCode, errResp.Message)
 		return
 	}
 
@@ -452,21 +392,8 @@ func (m *Manager) DoHealthChecks() {
 }
 
 func (m *Manager) stopTask(worker string, taskID string) {
-	client := &http.Client{}
-	url := fmt.Sprintf("http://%s/tasks/%s", worker, taskID)
-	req, err := http.NewRequest("DELETE", url, nil)
+	err := m.WorkerClient.StopTask(worker, taskID)
 	if err != nil {
-		log.Printf("error creating request to delete task %s: %v\n", taskID, err)
-		return
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Error connecting to worker at %s: %v\n", url, err)
-		return
-	}
-
-	if resp.StatusCode != 204 {
 		log.Printf("Error sending request: %v\n", err)
 		return
 	}
