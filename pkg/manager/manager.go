@@ -21,138 +21,183 @@ import (
 )
 
 type Manager struct {
-	Pending        queue.Queue
-	TaskDB         map[uuid.UUID]*task.Task
-	EventDB        map[uuid.UUID]*task.TaskEvent
-	Workers        []string //this is an array of address strings, not worker objects.
-	WorkersTaskMap map[string][]uuid.UUID
-	TaskWorkersMap map[uuid.UUID]string
-	LastWorker     int
-	WorkerNodes    []*node.Node
-	Scheduler      scheduler.Scheduler
-	WorkerClient   WorkerCommunicator
-	Store          store.Store
+	Pending      queue.Queue
+	Scheduler    scheduler.Scheduler
+	WorkerClient WorkerCommunicator
+	Store        store.Store
 }
 
-func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
-	candidates := m.Scheduler.SelectCandidateNodes(t, m.WorkerNodes)
-	if candidates == nil {
-		msg := fmt.Sprintf("No available candidates match resource request for task %v", t.ID)
-		err := errors.New(msg)
-		return nil, err
+func (m *Manager) SelectWorker(ctx context.Context, t task.Task) (*store.Worker, error) {
+	if m.Store == nil {
+		return nil, errors.New("store not configured")
+	}
 
+	workers, err := m.Store.ListWorkers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(workers) == 0 {
+		return nil, fmt.Errorf("no workers registered")
+	}
+
+	workerMap := make(map[string]store.Worker)
+	nodes := make([]*node.Node, 0, len(workers))
+	for _, w := range workers {
+		workerMap[w.ID] = w
+		n := node.NewNode(w.ID, w.Address, "worker")
+		nodes = append(nodes, n)
+	}
+
+	candidates := m.Scheduler.SelectCandidateNodes(t, nodes)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no available candidates match resource request for task %v", t.ID)
 	}
 
 	scores := m.Scheduler.Score(t, candidates)
 	selectedNode := m.Scheduler.Pick(scores, candidates)
+	if selectedNode == nil {
+		return nil, fmt.Errorf("scheduler failed to pick a worker for task %v", t.ID)
+	}
 
-	return selectedNode, nil
+	selectedWorker, ok := workerMap[selectedNode.Name]
+	if !ok {
+		return nil, fmt.Errorf("selected worker %s not found", selectedNode.Name)
+	}
+
+	return &selectedWorker, nil
 
 }
 
 func (m *Manager) updateTasks() {
-	for _, worker := range m.Workers {
-		log.Printf("Checking worker %v for task updates", worker)
-		tasks, err := m.WorkerClient.FetchTasks(worker)
+	if m.Store == nil {
+		log.Println("Store not configured; skipping task update")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	workers, err := m.Store.ListWorkers(ctx)
+	cancel()
+	if err != nil {
+		log.Printf("Error listing workers: %v", err)
+		return
+	}
+
+	for _, worker := range workers {
+		log.Printf("Checking worker %v for task updates", worker.ID)
+		tasks, err := m.WorkerClient.FetchTasks(worker.Address)
 		if err != nil {
-			log.Printf("Error connecting to %v: %v\n", worker, err)
+			log.Printf("Error connecting to %v: %v\n", worker.Address, err)
+			continue
 		}
 
 		for _, t := range tasks {
 			log.Printf("Attempting to update task %v\n", t)
-			_, ok := m.TaskDB[t.ID]
-			if !ok {
-				log.Printf("Task with ID %s not found\n", t.ID)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			persisted, _, err := m.Store.GetTask(ctx, t.ID)
+			cancel()
+			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					log.Printf("Task with ID %s not found in store\n", t.ID)
+					continue
+				}
+				log.Printf("Error retrieving task %s from store: %v", t.ID, err)
 				continue
 			}
 
-			if m.TaskDB[t.ID].State != t.State {
-				m.TaskDB[t.ID].State = t.State
-			}
+			persisted.State = t.State
+			persisted.StartTime = t.StartTime
+			persisted.EndTime = t.EndTime
+			persisted.ContainerID = t.ContainerID
 
-			m.TaskDB[t.ID].StartTime = t.StartTime
-			m.TaskDB[t.ID].EndTime = t.EndTime
-			m.TaskDB[t.ID].ContainerID = t.ContainerID
-
-			if m.Store != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := m.Store.UpdateTaskState(ctx, m.TaskDB[t.ID], worker); err != nil {
-					log.Printf("Error updating task %s in store: %v", t.ID, err)
-				}
-				cancel()
+			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+			if err := m.Store.UpdateTaskState(ctx, persisted, worker.ID); err != nil {
+				log.Printf("Error updating task %s in store: %v", t.ID, err)
 			}
+			cancel()
 		}
 	}
 
 }
 
 func (m *Manager) SendWork() {
-	if m.Pending.Len() > 0 {
-		e := m.Pending.Dequeue()
-		te := e.(task.TaskEvent)
-		m.EventDB[te.ID] = &te
-		log.Printf("Pulled task %v off the managers queue", te)
-
-		taskWorker, ok := m.TaskWorkersMap[te.Task.ID]
-		if ok {
-			persistedTask := m.TaskDB[te.Task.ID]
-			if persistedTask == nil {
-				log.Printf("Task %s not found in TaskDB\n", te.Task.ID)
-				return
-			}
-			if te.State == task.Completed && task.ValidStateTransition(persistedTask.State, te.State) {
-				m.stopTask(taskWorker, te.Task.ID.String())
-				return
-			} else {
-				log.Printf("%v", persistedTask)
-				log.Printf("Invalid request: existing task %s is in state %v and cannot transition to the completed state\n",
-					persistedTask.ID.String(), persistedTask.State)
-				return
-			}
-		}
-
-		t := te.Task
-		w, err := m.SelectWorker(t)
-
-		if err != nil {
-			log.Printf("Error selecting worker for task %v: %v", t, err)
-			m.Pending.Enqueue(te)
-			return
-
-		}
-
-		// Add task to TaskDB for tracking
-		m.TaskDB[t.ID] = &t
-		m.WorkersTaskMap[w.Name] = append(m.WorkersTaskMap[w.Name], te.Task.ID)
-		m.TaskWorkersMap[t.ID] = w.Name
-
-		newTask, errResp, err := m.WorkerClient.StartTask(w.Name, te)
-		if err != nil {
-			log.Printf("Error connecting to %v: %v\n", w, err)
-			m.Pending.Enqueue(te)
-			return
-		}
-
-		if errResp != nil {
-			log.Printf("Response error (%d): %s", errResp.HTTPStatusCode, errResp.Message)
-			return
-		}
-
-		if newTask != nil {
-			m.TaskDB[newTask.ID] = newTask
-
-			if m.Store != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := m.Store.CreateTask(ctx, newTask, w.Name); err != nil {
-					log.Printf("Error persisting task %s: %v", newTask.ID, err)
-				}
-				cancel()
-			}
-			log.Printf("%#v\n", *newTask)
-		}
-
-	} else {
+	if m.Pending.Len() == 0 {
 		log.Println("No work in the queue")
+		return
+	}
+
+	e := m.Pending.Dequeue()
+	te, ok := e.(task.TaskEvent)
+	if !ok {
+		log.Printf("Unexpected item in queue: %T", e)
+		return
+	}
+
+	log.Printf("Pulled task %v off the managers queue", te)
+
+	if m.Store == nil {
+		log.Println("Store not configured; cannot process task")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	existingTask, existingWorker, existingErr := m.Store.GetTask(ctx, te.Task.ID)
+	cancel()
+	if existingErr != nil && !errors.Is(existingErr, store.ErrNotFound) {
+		log.Printf("Error retrieving task %s from store: %v", te.Task.ID, existingErr)
+		m.Pending.Enqueue(te)
+		return
+	}
+
+	if existingWorker != "" && existingTask != nil {
+		if te.State == task.Completed && task.ValidStateTransition(existingTask.State, te.State) {
+			m.stopTask(existingWorker, te.Task.ID.String())
+			return
+		}
+
+		log.Printf("Invalid request: existing task %s is in state %v and cannot transition to the completed state\n",
+			existingTask.ID.String(), existingTask.State)
+		return
+	}
+
+	t := te.Task
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	w, err := m.SelectWorker(ctx, t)
+	cancel()
+
+	if err != nil {
+		log.Printf("Error selecting worker for task %v: %v", t, err)
+		m.Pending.Enqueue(te)
+		return
+
+	}
+
+	newTask, errResp, err := m.WorkerClient.StartTask(w.Address, te)
+	if err != nil {
+		log.Printf("Error connecting to %v: %v\n", w.ID, err)
+		m.Pending.Enqueue(te)
+		return
+	}
+
+	if errResp != nil {
+		log.Printf("Response error (%d): %s", errResp.HTTPStatusCode, errResp.Message)
+		return
+	}
+
+	if newTask != nil {
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		if errors.Is(existingErr, store.ErrNotFound) {
+			if err := m.Store.CreateTask(ctx, newTask, w.ID); err != nil {
+				log.Printf("Error persisting task %s: %v", newTask.ID, err)
+			}
+		} else {
+			if err := m.Store.UpdateTaskState(ctx, newTask, w.ID); err != nil {
+				log.Printf("Error updating task %s: %v", newTask.ID, err)
+			}
+		}
+		cancel()
+		log.Printf("%#v\n", *newTask)
 	}
 }
 
@@ -160,9 +205,15 @@ func (m *Manager) AddTask(te task.TaskEvent) {
 	m.Pending.Enqueue(te)
 
 	if m.Store != nil {
+		workerID := ""
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if _, existingWorker, err := m.Store.GetTask(ctx, te.Task.ID); err == nil {
+			workerID = existingWorker
+		}
+		cancel()
+
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		// Persist immediately so a manager restart can restore tasks even before dispatch.
-		workerID := m.TaskWorkersMap[te.Task.ID]
 		if err := m.Store.CreateTask(ctx, &te.Task, workerID); err != nil {
 			log.Printf("Error persisting enqueued task %s: %v", te.Task.ID, err)
 		}
@@ -171,20 +222,6 @@ func (m *Manager) AddTask(te task.TaskEvent) {
 }
 
 func New(workers []string, schedulerType string, st store.Store) *Manager {
-	TaskDB := make(map[uuid.UUID]*task.Task)
-	EventDB := make(map[uuid.UUID]*task.TaskEvent)
-	WorkerTaskMap := make(map[string][]uuid.UUID)
-	TaskWorkerMap := make(map[uuid.UUID]string)
-
-	var nodes []*node.Node
-
-	for worker := range workers {
-		WorkerTaskMap[workers[worker]] = []uuid.UUID{}
-		nAPI := fmt.Sprintf("http://%v", workers[worker])
-		n := node.NewNode(workers[worker], nAPI, "worker")
-		nodes = append(nodes, n)
-	}
-
 	var s scheduler.Scheduler
 	switch schedulerType {
 	case "roundrobin":
@@ -196,59 +233,29 @@ func New(workers []string, schedulerType string, st store.Store) *Manager {
 	}
 
 	m := &Manager{
-		Pending:        *queue.New(),
-		Workers:        workers,
-		TaskDB:         TaskDB,
-		EventDB:        EventDB,
-		WorkersTaskMap: WorkerTaskMap,
-		TaskWorkersMap: TaskWorkerMap,
-		WorkerNodes:    nodes,
-		Scheduler:      s,
-		WorkerClient:   NewHTTPWorkerClient(nil),
-		Store:          st,
+		Pending:      *queue.New(),
+		Scheduler:    s,
+		WorkerClient: NewHTTPWorkerClient(nil),
+		Store:        st,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	m.registerWorkers(ctx)
-	m.loadPersistedState(ctx)
+	m.registerWorkers(ctx, workers)
 
 	return m
 }
 
-func (m *Manager) registerWorkers(ctx context.Context) {
+func (m *Manager) registerWorkers(ctx context.Context, workers []string) {
 	if m.Store == nil {
 		return
 	}
 
-	for _, worker := range m.Workers {
+	for _, worker := range workers {
 		meta := store.Worker{ID: worker, Address: worker, Heartbeat: time.Now().UTC()}
 		if err := m.Store.RegisterWorker(ctx, meta); err != nil {
 			log.Printf("Error registering worker %s: %v", worker, err)
-		}
-	}
-}
-
-func (m *Manager) loadPersistedState(ctx context.Context) {
-	if m.Store == nil {
-		return
-	}
-
-	tasks, err := m.Store.ListTasks(ctx)
-	if err != nil {
-		log.Printf("Error loading tasks from store: %v", err)
-		return
-	}
-
-	for _, rec := range tasks {
-		m.TaskDB[rec.Task.ID] = rec.Task
-		if rec.WorkerID != "" {
-			if _, ok := m.WorkersTaskMap[rec.WorkerID]; !ok {
-				m.WorkersTaskMap[rec.WorkerID] = []uuid.UUID{}
-			}
-			m.WorkersTaskMap[rec.WorkerID] = append(m.WorkersTaskMap[rec.WorkerID], rec.Task.ID)
-			m.TaskWorkersMap[rec.Task.ID] = rec.WorkerID
 		}
 	}
 }
@@ -306,12 +313,19 @@ func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tID, _ := uuid.Parse(taskID)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
-	taskToStop, ok := a.Manager.TaskDB[tID]
-
-	if !ok {
-		log.Printf("No task with ID %v found", tID)
-		w.WriteHeader(404)
+	taskToStop, workerID, err := a.Manager.Store.GetTask(ctx, tID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			log.Printf("No task with ID %v found", tID)
+			w.WriteHeader(404)
+			return
+		}
+		log.Printf("Error retrieving task %v: %v", tID, err)
+		w.WriteHeader(500)
+		return
 	}
 
 	te := task.TaskEvent{
@@ -323,6 +337,13 @@ func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	taskCopy := *taskToStop
 	taskCopy.State = task.Completed
 	te.Task = taskCopy
+	te.Task.RestartCount = taskToStop.RestartCount
+	// Preserve the worker assignment so it can be used during stop processing.
+	if workerID != "" {
+		if err := a.Manager.Store.CreateTask(ctx, &te.Task, workerID); err != nil {
+			log.Printf("Error persisting stop request for task %v: %v", tID, err)
+		}
+	}
 	a.Manager.AddTask(te)
 
 	log.Printf("Added task event %v to stop task %v\n", te.ID, taskToStop.ID)
@@ -331,9 +352,22 @@ func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) GetTasks() []*task.Task {
-	tasks := []*task.Task{}
-	for _, t := range m.TaskDB {
-		tasks = append(tasks, t)
+	if m.Store == nil {
+		return []*task.Task{}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	records, err := m.Store.ListTasks(ctx)
+	if err != nil {
+		log.Printf("Error retrieving tasks from store: %v", err)
+		return []*task.Task{}
+	}
+
+	tasks := make([]*task.Task, 0, len(records))
+	for _, rec := range records {
+		tasks = append(tasks, rec.Task)
 	}
 	return tasks
 }
@@ -383,8 +417,24 @@ func (m *Manager) getHostPort(ports nat.PortMap) *string {
 
 func (m *Manager) checkTaskHealth(t task.Task) error {
 	log.Printf("Calling health check for task %s: %s\n", t.ID, t.HealthCheck)
+	if m.Store == nil {
+		return errors.New("store not configured")
+	}
 
-	w := m.TaskWorkersMap[t.ID]
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, workerID, err := m.Store.GetTask(ctx, t.ID)
+	cancel()
+	if err != nil {
+		msg := fmt.Sprintf("Error retrieving worker for task %s: %v", t.ID, err)
+		log.Println(msg)
+		return errors.New(msg)
+	}
+
+	if workerID == "" {
+		msg := fmt.Sprintf("No worker assigned for task %s", t.ID)
+		log.Println(msg)
+		return errors.New(msg)
+	}
 
 	hostPort := m.getHostPort(t.HostPorts)
 	if hostPort == nil {
@@ -393,7 +443,7 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 		return errors.New(msg)
 	}
 
-	worker := strings.Split(w, ":")
+	worker := strings.Split(workerID, ":")
 	url := fmt.Sprintf("http://%s:%s%s", worker[0], *hostPort, t.HealthCheck)
 
 	log.Printf("Calling health check for task %s: %s\n", t.ID, url)
@@ -437,19 +487,32 @@ func (m *Manager) doHealthChecks() {
 }
 
 func (m *Manager) restartTask(t *task.Task) {
-	w := m.TaskWorkersMap[t.ID]
+	if m.Store == nil {
+		log.Println("Store not configured; cannot restart task")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, workerID, err := m.Store.GetTask(ctx, t.ID)
+	cancel()
+	if err != nil {
+		log.Printf("Error fetching task %s for restart: %v", t.ID, err)
+		return
+	}
+
+	if workerID == "" {
+		log.Printf("No worker assignment found for task %s; cannot restart", t.ID)
+		return
+	}
+
 	t.State = task.Scheduled
 	t.RestartCount++
 
-	m.TaskDB[t.ID] = t
-
-	if m.Store != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := m.Store.UpdateTaskState(ctx, t, w); err != nil {
-			log.Printf("Error persisting restart state for task %s: %v", t.ID, err)
-		}
-		cancel()
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	if err := m.Store.UpdateTaskState(ctx, t, workerID); err != nil {
+		log.Printf("Error persisting restart state for task %s: %v", t.ID, err)
 	}
+	cancel()
 
 	te := task.TaskEvent{
 		ID:        uuid.New(),
@@ -458,10 +521,10 @@ func (m *Manager) restartTask(t *task.Task) {
 		Task:      *t,
 	}
 
-	_, errResp, err := m.WorkerClient.StartTask(w, te)
+	_, errResp, err := m.WorkerClient.StartTask(workerID, te)
 	if err != nil {
-		log.Printf("Error connecting to %v: %v", w, err)
-		m.Pending.Enqueue(t)
+		log.Printf("Error connecting to %v: %v", workerID, err)
+		m.Pending.Enqueue(te)
 		return
 	}
 
@@ -491,19 +554,27 @@ func (m *Manager) stopTask(worker string, taskID string) {
 		return
 	}
 	if id, err := uuid.Parse(taskID); err == nil {
-		if t, ok := m.TaskDB[id]; ok {
-			t.State = task.Completed
-			t.EndTime = time.Now().UTC()
-			m.TaskDB[id] = t
-
-			if m.Store != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := m.Store.UpdateTaskState(ctx, t, worker); err != nil {
-					log.Printf("Error persisting stop for task %s: %v", taskID, err)
-				}
-				cancel()
-			}
+		if m.Store == nil {
+			log.Println("Store not configured; cannot persist stop")
+			return
 		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t, _, err := m.Store.GetTask(ctx, id)
+		cancel()
+		if err != nil {
+			log.Printf("Error fetching task %s to persist stop: %v", taskID, err)
+			return
+		}
+
+		t.State = task.Completed
+		t.EndTime = time.Now().UTC()
+
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		if err := m.Store.UpdateTaskState(ctx, t, worker); err != nil {
+			log.Printf("Error persisting stop for task %s: %v", taskID, err)
+		}
+		cancel()
 	}
 
 	log.Printf("Task %s has been scheduled to be stopped", taskID)
