@@ -90,7 +90,12 @@ func main() {
 		log.Fatalf("Failed to initialize etcd store: %v", err)
 	}
 
-	m := manager.New(workers, "epvm", etcdStore)
+	m := manager.NewWithConfig(manager.Config{
+		Workers:       workers,
+		SchedulerType: "epvm",
+		Store:         etcdStore,
+		Role:          manager.ManagerRoleLeader,
+	})
 	mapi := manager.Api{Address: mhost, Port: mport, Manager: m}
 
 	go m.ProcessTasks()
@@ -113,7 +118,9 @@ func main() {
 			State: task.Running,
 			Task:  t,
 		}
-		m.AddTask(te)
+		if err := m.AddTask(te); err != nil {
+			log.Printf("Failed to enqueue task %s: %v", te.Task.ID, err)
+		}
 	}
 
 	// Keep main goroutine alive

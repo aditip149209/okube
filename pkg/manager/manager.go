@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -22,7 +23,27 @@ import (
 
 const heartbeatStaleAfter = 30 * time.Second
 
+type ManagerRole string
+
+const (
+	ManagerRoleLeader   ManagerRole = "leader"
+	ManagerRoleFollower ManagerRole = "follower"
+)
+
+var ErrNotLeader = errors.New("manager: not leader")
+
+type Config struct {
+	Workers       []string
+	SchedulerType string
+	Store         store.Store
+	Role          ManagerRole
+	ID            string
+	WorkerClient  WorkerCommunicator
+}
+
 type Manager struct {
+	ID           string
+	Role         ManagerRole
 	Pending      queue.Queue
 	Scheduler    scheduler.Scheduler
 	WorkerClient WorkerCommunicator
@@ -93,6 +114,10 @@ func (m *Manager) SelectWorker(ctx context.Context, t task.Task) (*store.Worker,
 }
 
 func (m *Manager) updateTasks() {
+	if !m.IsLeader() {
+		log.Printf("Manager %s is in follower role; skipping task state updates", m.ID)
+		return
+	}
 	if m.Store == nil {
 		log.Println("Store not configured; skipping task update")
 		return
@@ -145,6 +170,10 @@ func (m *Manager) updateTasks() {
 }
 
 func (m *Manager) SendWork() {
+	if !m.IsLeader() {
+		log.Printf("Manager %s is in follower role; skipping scheduling", m.ID)
+		return
+	}
 	if m.Pending.Len() == 0 {
 		log.Println("No work in the queue")
 		return
@@ -224,7 +253,11 @@ func (m *Manager) SendWork() {
 	}
 }
 
-func (m *Manager) AddTask(te task.TaskEvent) {
+func (m *Manager) AddTask(te task.TaskEvent) error {
+	if !m.IsLeader() {
+		log.Printf("Manager %s is in follower role; rejecting task add", m.ID)
+		return ErrNotLeader
+	}
 	m.Pending.Enqueue(te)
 
 	if m.Store != nil {
@@ -238,15 +271,32 @@ func (m *Manager) AddTask(te task.TaskEvent) {
 		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		// Persist immediately so a manager restart can restore tasks even before dispatch.
 		if err := m.Store.CreateTask(ctx, &te.Task, workerID); err != nil {
-			log.Printf("Error persisting enqueued task %s: %v", te.Task.ID, err)
+			cancel()
+			return err
 		}
 		cancel()
 	}
+
+	return nil
 }
 
 func New(workers []string, schedulerType string, st store.Store) *Manager {
+	return NewWithConfig(Config{Workers: workers, SchedulerType: schedulerType, Store: st})
+}
+
+func NewWithConfig(cfg Config) *Manager {
+	role := cfg.Role
+	if role == "" {
+		role = ManagerRoleFollower
+	}
+
+	id := cfg.ID
+	if id == "" {
+		id = defaultManagerID()
+	}
+
 	var s scheduler.Scheduler
-	switch schedulerType {
+	switch cfg.SchedulerType {
 	case "roundrobin":
 		s = &scheduler.RoundRobin{Name: "roundrobin"}
 	case "epvm":
@@ -255,23 +305,51 @@ func New(workers []string, schedulerType string, st store.Store) *Manager {
 		s = &scheduler.RoundRobin{Name: "roundrobin"}
 	}
 
+	wc := cfg.WorkerClient
+	if wc == nil {
+		wc = NewHTTPWorkerClient(nil)
+	}
+
 	m := &Manager{
+		ID:           id,
+		Role:         role,
 		Pending:      *queue.New(),
 		Scheduler:    s,
-		WorkerClient: NewHTTPWorkerClient(nil),
-		Store:        st,
+		WorkerClient: wc,
+		Store:        cfg.Store,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	m.registerWorkers(ctx, workers)
+	m.registerWorkers(ctx, cfg.Workers)
 
 	return m
 }
 
+func defaultManagerID() string {
+	if envID := os.Getenv("OKUBE_MANAGER_ID"); envID != "" {
+		return envID
+	}
+
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+
+	return uuid.New().String()
+}
+
+func (m *Manager) IsLeader() bool {
+	return m.Role == ManagerRoleLeader
+}
+
 func (m *Manager) registerWorkers(ctx context.Context, workers []string) {
 	if m.Store == nil {
+		return
+	}
+
+	if !m.IsLeader() {
+		log.Printf("Manager %s is in follower role; skipping worker registration", m.ID)
 		return
 	}
 
@@ -297,6 +375,12 @@ type ErrResponse struct {
 }
 
 func (a *Api) RegisterWorkerHandler(w http.ResponseWriter, r *http.Request) {
+	if !a.Manager.IsLeader() {
+		msg := "manager is follower; worker registration disabled"
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: msg})
+		return
+	}
 	if a.Manager.Store == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -337,6 +421,12 @@ func (a *Api) RegisterWorkerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Api) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if !a.Manager.IsLeader() {
+		msg := "manager is follower; heartbeat updates disabled"
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: msg})
+		return
+	}
 	if a.Manager.Store == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -369,6 +459,12 @@ func (a *Api) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
+	if !a.Manager.IsLeader() {
+		msg := "manager is follower; task creation disabled"
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: msg})
+		return
+	}
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
 
@@ -388,7 +484,13 @@ func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.Manager.AddTask(te)
+	if err := a.Manager.AddTask(te); err != nil {
+		msg := fmt.Sprintf("Unable to add task: %v", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: msg})
+		return
+	}
+
 	log.Printf("Added task %v\n", te.Task.ID)
 	w.WriteHeader(201)
 	json.NewEncoder(w).Encode(te)
@@ -401,6 +503,12 @@ func (a *Api) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
+	if !a.Manager.IsLeader() {
+		msg := "manager is follower; task stop disabled"
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: msg})
+		return
+	}
 	taskID := chi.URLParam(r, "taskID")
 	if taskID == "" {
 		log.Printf("No TaskID passed in request.\n")
@@ -439,7 +547,12 @@ func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Error persisting stop request for task %v: %v", tID, err)
 		}
 	}
-	a.Manager.AddTask(te)
+	if err := a.Manager.AddTask(te); err != nil {
+		msg := fmt.Sprintf("Unable to enqueue stop request: %v", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: msg})
+		return
+	}
 
 	log.Printf("Added task event %v to stop task %v\n", te.ID, taskToStop.ID)
 	w.WriteHeader(204)
@@ -491,6 +604,11 @@ func (a *Api) Start() {
 
 func (m *Manager) UpdateTasks() {
 	for {
+		if !m.IsLeader() {
+			log.Printf("Manager %s is in follower role; skipping worker task sync", m.ID)
+			time.Sleep(15 * time.Second)
+			continue
+		}
 		log.Println("Checking for task updates from workers")
 		m.updateTasks()
 		log.Println("Tasks update completed")
@@ -501,6 +619,11 @@ func (m *Manager) UpdateTasks() {
 
 func (m *Manager) ProcessTasks() {
 	for {
+		if !m.IsLeader() {
+			log.Printf("Manager %s is in follower role; skipping task processing", m.ID)
+			time.Sleep(10 * time.Second)
+			continue
+		}
 		log.Println("Processing any tasks in the queue")
 		m.SendWork()
 		log.Printf("Sleeping for 10 seconds")
@@ -588,6 +711,10 @@ func (m *Manager) doHealthChecks() {
 }
 
 func (m *Manager) restartTask(t *task.Task) {
+	if !m.IsLeader() {
+		log.Printf("Manager %s is in follower role; skipping restart for task %s", m.ID, t.ID)
+		return
+	}
 	if m.Store == nil {
 		log.Println("Store not configured; cannot restart task")
 		return
@@ -640,6 +767,11 @@ func (m *Manager) restartTask(t *task.Task) {
 
 func (m *Manager) DoHealthChecks() {
 	for {
+		if !m.IsLeader() {
+			log.Printf("Manager %s is in follower role; skipping health checks", m.ID)
+			time.Sleep(60 * time.Second)
+			continue
+		}
 		log.Println("Performing task health check")
 		m.doHealthChecks()
 		log.Println("Task health checks completed")
@@ -649,6 +781,10 @@ func (m *Manager) DoHealthChecks() {
 }
 
 func (m *Manager) stopTask(worker string, taskID string) {
+	if !m.IsLeader() {
+		log.Printf("Manager %s is in follower role; skipping stop for task %s", m.ID, taskID)
+		return
+	}
 	err := m.WorkerClient.StopTask(worker, taskID)
 	if err != nil {
 		log.Printf("Error sending request: %v\n", err)
