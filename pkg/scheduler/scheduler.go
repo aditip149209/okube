@@ -96,6 +96,9 @@ func calculateCpuUsage(node *node.Node) (*float64, error) {
 		log.Println(msg)
 		return nil, errors.New(msg)
 	}
+	if stat1 == nil || stat1.CpuStats == nil {
+		return nil, errors.New("cpu stats unavailable for node")
+	}
 	time.Sleep(3 * time.Second)
 	stat2, err2 := node.GetNodeStats()
 
@@ -103,6 +106,9 @@ func calculateCpuUsage(node *node.Node) (*float64, error) {
 		msg := fmt.Sprintf("There was an error in calculateCPUusage part2: %v", err2)
 		log.Println(msg)
 		return nil, errors.New(msg)
+	}
+	if stat2 == nil || stat2.CpuStats == nil {
+		return nil, errors.New("cpu stats unavailable for node (second sample)")
 	}
 
 	stat1Idle := stat1.CpuStats.Idle + stat1.CpuStats.IOWait
@@ -157,7 +163,17 @@ func (e *Epvm) Score(t task.Task, nodes []*node.Node) map[string]float64 {
 			nodeScores[node.Name] = 1000.0 // High cost = low priority
 			continue
 		}
+		if stats == nil || stats.MemStats == nil || stats.MemStats.MemTotal == 0 {
+			log.Printf("Warning: Incomplete memory stats for node %s. Using default high score.", node.Name)
+			nodeScores[node.Name] = 1000.0
+			continue
+		}
 		memoryAllocated := float64(stats.MemUsedKb()) + float64(node.MemoryAllocated)
+		if node.Memory == 0 {
+			log.Printf("Warning: Node %s reports zero memory. Using default high score.", node.Name)
+			nodeScores[node.Name] = 1000.0
+			continue
+		}
 
 		memoryPercentAllocated := memoryAllocated / float64(node.Memory)
 

@@ -4,9 +4,12 @@ Copyright © 2026 NAME HERE <EMAIL ADDRESS>
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"time"
 
+	"github.com/aditip149209/okube/pkg/store"
 	"github.com/aditip149209/okube/pkg/task"
 	"github.com/aditip149209/okube/pkg/worker"
 	"github.com/golang-collections/collections/queue"
@@ -24,12 +27,29 @@ var workerCmd = &cobra.Command{
 		host, _ := cmd.Flags().GetString("host")
 		port, _ := cmd.Flags().GetInt("port")
 		name, _ := cmd.Flags().GetString("name")
+		managerHost, _ := cmd.Flags().GetString("manager-host")
+		managerPort, _ := cmd.Flags().GetInt("manager-port")
+
+		workerID := name
+		if workerID == "" {
+			workerID = fmt.Sprintf("worker-%s", uuid.New().String())
+		}
+
+		workerAddress := fmt.Sprintf("%s:%d", host, port)
+		managerAddress := fmt.Sprintf("%s:%d", managerHost, managerPort)
 		log.Println("Starting worker.")
 		w := worker.Worker{
-			Name:  name,
+			Name:  workerID,
 			Queue: *queue.New(),
 			Db:    make(map[uuid.UUID]*task.Task),
 		}
+
+		ctx := context.Background()
+		if err := worker.RegisterWithManager(ctx, managerAddress, store.Worker{ID: workerID, Address: workerAddress}); err != nil {
+			log.Fatalf("Failed to register worker %s: %v", workerID, err)
+		}
+		go worker.StartHeartbeat(ctx, managerAddress, workerID, 10*time.Second)
+
 		api := worker.Api{Address: host, Port: port, Worker: &w}
 		go w.RunTasks()
 		go w.CollectStats()
@@ -44,5 +64,7 @@ func init() {
 	workerCmd.Flags().StringP("host", "H", "0.0.0.0", "Hostname or IP address")
 	workerCmd.Flags().IntP("port", "p", 5556, "Port on which to listen")
 	workerCmd.Flags().StringP("name", "n", fmt.Sprintf("worker-%s", uuid.New().String()), "Name of the worker")
+	workerCmd.Flags().String("manager-host", "localhost", "Manager host to register with")
+	workerCmd.Flags().Int("manager-port", 5556, "Manager port to register with")
 	workerCmd.Flags().StringP("dbtype", "d", "memory", "Type of datastore to use for tasks (\"memory\" or \"persistent\")")
 }

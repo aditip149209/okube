@@ -20,6 +20,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const heartbeatStaleAfter = 30 * time.Second
+
 type Manager struct {
 	Pending      queue.Queue
 	Scheduler    scheduler.Scheduler
@@ -27,7 +29,7 @@ type Manager struct {
 	Store        store.Store
 }
 
-func (m *Manager) SelectWorker(ctx context.Context, t task.Task) (*store.Worker, error) {
+func (m *Manager) activeWorkers(ctx context.Context) ([]store.Worker, error) {
 	if m.Store == nil {
 		return nil, errors.New("store not configured")
 	}
@@ -37,8 +39,29 @@ func (m *Manager) SelectWorker(ctx context.Context, t task.Task) (*store.Worker,
 		return nil, err
 	}
 
-	if len(workers) == 0 {
-		return nil, fmt.Errorf("no workers registered")
+	cutoff := time.Now().UTC().Add(-heartbeatStaleAfter)
+	live := make([]store.Worker, 0, len(workers))
+	for _, w := range workers {
+		if w.Heartbeat.After(cutoff) {
+			live = append(live, w)
+		}
+	}
+
+	if len(live) == 0 {
+		return nil, fmt.Errorf("no workers with heartbeat in the last %s", heartbeatStaleAfter)
+	}
+
+	return live, nil
+}
+
+func (m *Manager) SelectWorker(ctx context.Context, t task.Task) (*store.Worker, error) {
+	if m.Store == nil {
+		return nil, errors.New("store not configured")
+	}
+
+	workers, err := m.activeWorkers(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	workerMap := make(map[string]store.Worker)
@@ -76,7 +99,7 @@ func (m *Manager) updateTasks() {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	workers, err := m.Store.ListWorkers(ctx)
+	workers, err := m.activeWorkers(ctx)
 	cancel()
 	if err != nil {
 		log.Printf("Error listing workers: %v", err)
@@ -273,6 +296,78 @@ type ErrResponse struct {
 	Message        string `json:"message"`
 }
 
+func (a *Api) RegisterWorkerHandler(w http.ResponseWriter, r *http.Request) {
+	if a.Manager.Store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	var worker store.Worker
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&worker); err != nil {
+		msg := fmt.Sprintf("Error unmarshalling body: %v", err)
+		log.Print(msg)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusBadRequest, Message: msg})
+		return
+	}
+
+	if worker.ID == "" || worker.Address == "" {
+		msg := "worker id and address are required"
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusBadRequest, Message: msg})
+		return
+	}
+
+	worker.Heartbeat = time.Now().UTC()
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := a.Manager.Store.RegisterWorker(ctx, worker); err != nil {
+		msg := fmt.Sprintf("Error registering worker %s: %v", worker.ID, err)
+		log.Print(msg)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusInternalServerError, Message: msg})
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(worker)
+}
+
+func (a *Api) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if a.Manager.Store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	workerID := chi.URLParam(r, "workerID")
+	if workerID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusBadRequest, Message: "worker id is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := a.Manager.Store.UpdateWorkerHeartbeat(ctx, workerID, time.Now().UTC()); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusNotFound, Message: "worker not registered"})
+			return
+		}
+		msg := fmt.Sprintf("Error updating heartbeat for worker %s: %v", workerID, err)
+		log.Print(msg)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusInternalServerError, Message: msg})
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
@@ -379,6 +474,12 @@ func (a *Api) initRouter() {
 		r.Get("/", a.GetTasksHandler)
 		r.Route("/{taskID}", func(r chi.Router) {
 			r.Delete("/", a.StopTaskHandler)
+		})
+	})
+	a.Router.Route("/workers", func(r chi.Router) {
+		r.Post("/", a.RegisterWorkerHandler)
+		r.Route("/{workerID}", func(r chi.Router) {
+			r.Put("/heartbeat", a.HeartbeatHandler)
 		})
 	})
 }

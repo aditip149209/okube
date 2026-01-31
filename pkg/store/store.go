@@ -33,4 +33,5 @@ type Store interface {
 	ListTasks(ctx context.Context) ([]TaskRecord, error)
 	RegisterWorker(ctx context.Context, worker Worker) error
 	ListWorkers(ctx context.Context) ([]Worker, error)
+	UpdateWorkerHeartbeat(ctx context.Context, workerID string, heartbeat time.Time) error
 }

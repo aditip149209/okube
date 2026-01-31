@@ -81,6 +81,29 @@ func (e *EtcdStore) workerHeartbeatKey(id string) string {
 	return fmt.Sprintf("%s/workers/%s/heartbeat", e.prefix, id)
 }
 
+// UpdateWorkerHeartbeat persists a new heartbeat timestamp for a worker.
+func (e *EtcdStore) UpdateWorkerHeartbeat(ctx context.Context, workerID string, heartbeat time.Time) error {
+	hbBytes, err := json.Marshal(heartbeat)
+	if err != nil {
+		return err
+	}
+
+	workerKey := e.workerKey(workerID)
+	resp, err := e.client.Get(ctx, workerKey)
+	if err != nil {
+		return err
+	}
+
+	if resp.Count == 0 {
+		return ErrNotFound
+	}
+
+	_, err = e.client.Txn(ctx).Then(
+		clientv3.OpPut(e.workerHeartbeatKey(workerID), string(hbBytes)),
+	).Commit()
+	return err
+}
+
 // CreateTask stores a task and its assignment.
 func (e *EtcdStore) CreateTask(ctx context.Context, t *task.Task, workerID string) error {
 	if t == nil {
