@@ -160,6 +160,8 @@ func New(workers []string, schedulerType string) *Manager {
 	switch schedulerType {
 	case "roundrobin":
 		s = &scheduler.RoundRobin{Name: "roundrobin"}
+	case "epvm":
+		s = &scheduler.Epvm{Name: "epvm"}
 	default:
 		s = &scheduler.RoundRobin{Name: "roundrobin"}
 	}
@@ -311,6 +313,12 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 	w := m.TaskWorkersMap[t.ID]
 
 	hostPort := m.getHostPort(t.HostPorts)
+	if hostPort == nil {
+		msg := fmt.Sprintf("No host port found for task %s", t.ID)
+		log.Println(msg)
+		return errors.New(msg)
+	}
+
 	worker := strings.Split(w, ":")
 	url := fmt.Sprintf("http://%s:%s%s", worker[0], *hostPort, t.HealthCheck)
 
@@ -339,10 +347,13 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 func (m *Manager) doHealthChecks() {
 	for _, t := range m.GetTasks() {
 		if t.State == task.Running && t.RestartCount < 3 {
-			err := m.checkTaskHealth(*t)
-			if err != nil {
-				if t.RestartCount < 3 {
-					m.restartTask(t)
+			// Only check health if a health check URL is defined
+			if t.HealthCheck != "" {
+				err := m.checkTaskHealth(*t)
+				if err != nil {
+					if t.RestartCount < 3 {
+						m.restartTask(t)
+					}
 				}
 			}
 		} else if t.State == task.Failed && t.RestartCount < 3 {

@@ -1,8 +1,18 @@
 package scheduler
 
 import (
+	"errors"
+	"fmt"
+	"log"
+	"math"
+	"time"
+
 	"github.com/aditip149209/okube/pkg/node"
 	"github.com/aditip149209/okube/pkg/task"
+)
+
+const (
+	LIEB = 1.53960071783900203869
 )
 
 type Scheduler interface {
@@ -64,18 +74,126 @@ type Epvm struct {
 	Name string
 }
 
-func checkDisk(t task.Task, diskAvailable int) bool {
+func checkDisk(t task.Task, diskAvailable int64) bool {
 	return t.Disk <= int(diskAvailable)
-
 }
 
 func (e *Epvm) SelectCandidateNodes(t task.Task, nodes []*node.Node) []*node.Node {
 	var candidates []*node.Node
 	for node := range nodes {
-		if checkDisk(t, nodes[node].Disk-nodes[node].DiskAllocated) {
+		if checkDisk(t, nodes[node].Disk-int64(nodes[node].DiskAllocated)) {
 			candidates = append(candidates, nodes[node])
 		}
 	}
 	return candidates
 
+}
+
+func calculateCpuUsage(node *node.Node) (*float64, error) {
+	stat1, err1 := node.GetNodeStats()
+	if err1 != nil {
+		msg := fmt.Sprintf("There was an error in calculateCpuUsage: %v", err1)
+		log.Println(msg)
+		return nil, errors.New(msg)
+	}
+	time.Sleep(3 * time.Second)
+	stat2, err2 := node.GetNodeStats()
+
+	if err2 != nil {
+		msg := fmt.Sprintf("There was an error in calculateCPUusage part2: %v", err2)
+		log.Println(msg)
+		return nil, errors.New(msg)
+	}
+
+	stat1Idle := stat1.CpuStats.Idle + stat1.CpuStats.IOWait
+	stat2Idle := stat2.CpuStats.Idle + stat2.CpuStats.IOWait
+
+	stat1NonIdle := stat1.CpuStats.User + stat1.CpuStats.Nice + stat1.CpuStats.System + stat1.CpuStats.IRQ + stat1.CpuStats.SoftIRQ + stat1.CpuStats.Steal
+
+	stat2NonIdle := stat2.CpuStats.User + stat2.CpuStats.Nice + stat2.CpuStats.System + stat2.CpuStats.IRQ + stat2.CpuStats.SoftIRQ + stat2.CpuStats.Steal
+
+	stat1Total := stat1Idle + stat1NonIdle
+	stat2Total := stat2Idle + stat2NonIdle
+
+	total := stat2Total - stat1Total
+	idle := stat2Idle - stat1Idle
+
+	var cpuPercentUsage float64
+	if total == 0 && idle == 0 {
+		cpuPercentUsage = 0
+	} else {
+		cpuPercentUsage = (float64(total) - float64(idle)) / float64(total)
+	}
+
+	return &cpuPercentUsage, nil
+
+}
+
+func calculateLoad(val float64, max float64) float64 {
+	if max == 0 {
+		return 0
+	}
+	return val / max
+}
+
+func (e *Epvm) Score(t task.Task, nodes []*node.Node) map[string]float64 {
+	nodeScores := make(map[string]float64)
+	maxJobs := 4.0
+
+	for _, node := range nodes {
+		// Default to high cost if we can't get stats (node might be down/starting)
+		// This allows scheduling to continue with degraded information
+		cpuUsage, err := calculateCpuUsage(node)
+		if err != nil {
+			log.Printf("Warning: Could not calculate CPU usage for node %s: %v. Using default high score.", node.Name, err)
+			nodeScores[node.Name] = 1000.0 // High cost = low priority
+			continue
+		}
+		cpuLoad := calculateLoad(*cpuUsage, math.Pow(2, 0.8))
+
+		stats, err := node.GetNodeStats()
+		if err != nil {
+			log.Printf("Warning: Could not fetch stats for node %s: %v. Using default high score.", node.Name, err)
+			nodeScores[node.Name] = 1000.0 // High cost = low priority
+			continue
+		}
+		memoryAllocated := float64(stats.MemUsedKb()) + float64(node.MemoryAllocated)
+
+		memoryPercentAllocated := memoryAllocated / float64(node.Memory)
+
+		newMemPercent := calculateLoad(memoryAllocated+float64(t.Memory/1000), float64(node.Memory))
+
+		memCost := math.Pow(LIEB, newMemPercent) + math.Pow(LIEB, (float64(node.TaskCount+1))/maxJobs) - math.Pow(LIEB, memoryPercentAllocated) - math.Pow(LIEB, float64(node.TaskCount)/float64(maxJobs))
+
+		newCpuLoad := calculateLoad(cpuLoad+float64(t.Cpu), math.Pow(2, 0.8))
+
+		cpuCost := math.Pow(LIEB, newCpuLoad) + math.Pow(LIEB, (float64(node.TaskCount+1))/maxJobs) - math.Pow(LIEB, cpuLoad) - math.Pow(LIEB, float64(node.TaskCount)/float64(maxJobs))
+
+		marginalCost := memCost + cpuCost
+
+		nodeScores[node.Name] = marginalCost
+
+	}
+
+	return nodeScores
+
+}
+
+func (e *Epvm) Pick(scores map[string]float64, candidates []*node.Node) *node.Node {
+	minCost := 0.00
+	var bestNode *node.Node
+	for idx, node := range candidates {
+		if idx == 0 {
+			minCost = scores[node.Name]
+			bestNode = node
+			continue
+		}
+
+		if scores[node.Name] < minCost {
+			minCost = scores[node.Name]
+			bestNode = node
+		}
+	}
+
+	return bestNode
 }

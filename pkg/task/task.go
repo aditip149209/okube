@@ -31,7 +31,7 @@ var stateTransitionMap = map[State][]State{
 	Scheduled: []State{Scheduled, Running, Failed},
 	Running:   []State{Running, Completed, Failed},
 	Completed: []State{},
-	Failed:    []State{},
+	Failed:    []State{Scheduled},
 }
 
 type Task struct {
@@ -41,6 +41,7 @@ type Task struct {
 	Image         string
 	Memory        int
 	Disk          int
+	Cpu           int
 	ContainerID   string
 	ExposedPorts  nat.PortSet
 	PortBindings  map[string]string
