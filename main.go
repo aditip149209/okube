@@ -8,9 +8,11 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/aditip149209/okube/cmd"
 	"github.com/aditip149209/okube/pkg/manager"
+	"github.com/aditip149209/okube/pkg/store"
 	"github.com/aditip149209/okube/pkg/task"
 	"github.com/aditip149209/okube/pkg/worker"
 	"github.com/golang-collections/collections/queue"
@@ -80,7 +82,15 @@ func main() {
 		fmt.Sprintf("%s:%d", whost, wport+2),
 	}
 
-	m := manager.New(workers, "epvm")
+	etcdStore, err := store.NewEtcdStore(store.EtcdConfig{
+		Endpoints:   []string{"localhost:2379"},
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize etcd store: %v", err)
+	}
+
+	m := manager.New(workers, "epvm", etcdStore)
 	mapi := manager.Api{Address: mhost, Port: mport, Manager: m}
 
 	go m.ProcessTasks()
