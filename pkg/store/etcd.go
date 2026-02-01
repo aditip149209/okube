@@ -25,6 +25,33 @@ type EtcdStore struct {
 	prefix string
 }
 
+func (e *EtcdStore) managerPrefix() string {
+	return fmt.Sprintf("%s/managers", e.prefix)
+}
+
+func (e *EtcdStore) managerKey(id string) string {
+	return fmt.Sprintf("%s/managers/%s", e.prefix, id)
+}
+
+func (e *EtcdStore) leaderKey() string {
+	return fmt.Sprintf("%s/managers/leader", e.prefix)
+}
+
+// ManagerKey returns the fully qualified etcd key for the given manager ID.
+func (e *EtcdStore) ManagerKey(id string) string {
+	return e.managerKey(id)
+}
+
+// LeaderKey returns the etcd key used to store the active leader metadata.
+func (e *EtcdStore) LeaderKey() string {
+	return e.leaderKey()
+}
+
+// Client exposes the underlying etcd client for advanced coordination features.
+func (e *EtcdStore) Client() *clientv3.Client {
+	return e.client
+}
+
 // NewEtcdStore creates a new EtcdStore using the supplied config.
 func NewEtcdStore(cfg EtcdConfig) (*EtcdStore, error) {
 	endpoints := cfg.Endpoints

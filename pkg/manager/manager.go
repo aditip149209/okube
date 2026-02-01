@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aditip149209/okube/pkg/node"
@@ -19,9 +20,13 @@ import (
 	"github.com/go-chi/chi"
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 const heartbeatStaleAfter = 30 * time.Second
+const defaultLeaderTTL = 15 * time.Second
 
 type ManagerRole string
 
@@ -31,6 +36,11 @@ const (
 )
 
 var ErrNotLeader = errors.New("manager: not leader")
+
+type managerInfo struct {
+	ID        string    `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+}
 
 type Config struct {
 	Workers       []string
@@ -42,12 +52,170 @@ type Config struct {
 }
 
 type Manager struct {
-	ID           string
-	Role         ManagerRole
-	Pending      queue.Queue
-	Scheduler    scheduler.Scheduler
-	WorkerClient WorkerCommunicator
-	Store        store.Store
+	ID             string
+	Role           ManagerRole
+	roleMu         sync.RWMutex
+	Pending        queue.Queue
+	Scheduler      scheduler.Scheduler
+	WorkerClient   WorkerCommunicator
+	Store          store.Store
+	initialWorkers []string
+	etcdStore      *store.EtcdStore
+	etcdSession    *concurrency.Session
+	leaderKey      string
+	managerKey     string
+	electionStop   chan struct{}
+}
+
+func (m *Manager) startLeaderElection() {
+	go m.leaderElectionLoop()
+}
+
+func (m *Manager) leaderElectionLoop() {
+	retryDelay := 2 * time.Second
+
+	for {
+		select {
+		case <-m.electionStop:
+			return
+		default:
+		}
+
+		if m.etcdStore == nil {
+			return
+		}
+
+		session, err := concurrency.NewSession(m.etcdStore.Client(), concurrency.WithTTL(int(defaultLeaderTTL/time.Second)))
+		if err != nil {
+			log.Printf("Manager %s: unable to create etcd session for leader election: %v", m.ID, err)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		m.etcdSession = session
+
+		if err := m.registerManager(session); err != nil {
+			log.Printf("Manager %s: failed to register manager presence: %v", m.ID, err)
+			_ = session.Close()
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		// Attempt to become the leader immediately on startup.
+		m.tryAcquireLeadership(session)
+
+		watchCtx, cancel := context.WithCancel(context.Background())
+		go m.watchLeaderKey(watchCtx, session)
+
+		<-session.Done()
+		cancel()
+		m.setRole(ManagerRoleFollower)
+		log.Printf("Manager %s: etcd session closed; stepping down to follower", m.ID)
+		time.Sleep(retryDelay)
+	}
+}
+
+func (m *Manager) registerManager(session *concurrency.Session) error {
+	if session == nil {
+		return fmt.Errorf("etcd session is not initialized")
+	}
+
+	info := managerInfo{ID: m.ID, Timestamp: time.Now().UTC()}
+	payload, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = m.etcdStore.Client().Put(ctx, m.managerKey, string(payload), clientv3.WithLease(session.Lease()))
+	return err
+}
+
+func (m *Manager) tryAcquireLeadership(session *concurrency.Session) bool {
+	if session == nil {
+		return false
+	}
+
+	info := managerInfo{ID: m.ID, Timestamp: time.Now().UTC()}
+	payload, err := json.Marshal(info)
+	if err != nil {
+		log.Printf("Manager %s: failed to marshal leader payload: %v", m.ID, err)
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	txn := m.etcdStore.Client().Txn(ctx).If(
+		clientv3.Compare(clientv3.CreateRevision(m.leaderKey), "=", 0),
+	).Then(
+		clientv3.OpPut(m.leaderKey, string(payload), clientv3.WithLease(session.Lease())),
+	)
+
+	resp, err := txn.Commit()
+	if err != nil {
+		log.Printf("Manager %s: leader election transaction failed: %v", m.ID, err)
+		return false
+	}
+
+	if resp.Succeeded {
+		m.onBecameLeader()
+		return true
+	}
+
+	m.setRole(ManagerRoleFollower)
+	return false
+}
+
+func (m *Manager) onBecameLeader() {
+	wasLeader := m.IsLeader()
+	m.setRole(ManagerRoleLeader)
+	if !wasLeader {
+		log.Printf("Manager %s: became leader", m.ID)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		m.registerWorkers(ctx, m.initialWorkers)
+		cancel()
+	}
+}
+
+func (m *Manager) watchLeaderKey(ctx context.Context, session *concurrency.Session) {
+	if session == nil {
+		return
+	}
+
+	client := m.etcdStore.Client()
+	resp, err := client.Get(ctx, m.leaderKey)
+	if err == nil && (resp == nil || resp.Count == 0) {
+		m.tryAcquireLeadership(session)
+	}
+
+	watchOpts := []clientv3.OpOption{}
+	if resp != nil {
+		watchOpts = append(watchOpts, clientv3.WithRev(resp.Header.Revision+1))
+	}
+
+	watchChan := client.Watch(ctx, m.leaderKey, watchOpts...)
+	for watchResp := range watchChan {
+		if watchResp.Canceled {
+			return
+		}
+
+		for _, ev := range watchResp.Events {
+			switch ev.Type {
+			case mvccpb.DELETE:
+				log.Printf("Manager %s: detected missing leader key; attempting promotion", m.ID)
+				m.setRole(ManagerRoleFollower)
+				m.tryAcquireLeadership(session)
+			case mvccpb.PUT:
+				leaderID := string(ev.Kv.Value)
+				if leaderID != m.ID {
+					m.setRole(ManagerRoleFollower)
+				}
+			}
+		}
+	}
 }
 
 func (m *Manager) activeWorkers(ctx context.Context) ([]store.Worker, error) {
@@ -310,13 +478,24 @@ func NewWithConfig(cfg Config) *Manager {
 		wc = NewHTTPWorkerClient(nil)
 	}
 
+	initialWorkers := append([]string(nil), cfg.Workers...)
+
 	m := &Manager{
-		ID:           id,
-		Role:         role,
-		Pending:      *queue.New(),
-		Scheduler:    s,
-		WorkerClient: wc,
-		Store:        cfg.Store,
+		ID:             id,
+		Pending:        *queue.New(),
+		Scheduler:      s,
+		WorkerClient:   wc,
+		Store:          cfg.Store,
+		initialWorkers: initialWorkers,
+		electionStop:   make(chan struct{}),
+	}
+	m.setRole(role)
+
+	if etcdStore, ok := cfg.Store.(*store.EtcdStore); ok {
+		m.etcdStore = etcdStore
+		m.leaderKey = etcdStore.LeaderKey()
+		m.managerKey = etcdStore.ManagerKey(m.ID)
+		m.startLeaderElection()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -340,7 +519,15 @@ func defaultManagerID() string {
 }
 
 func (m *Manager) IsLeader() bool {
+	m.roleMu.RLock()
+	defer m.roleMu.RUnlock()
 	return m.Role == ManagerRoleLeader
+}
+
+func (m *Manager) setRole(role ManagerRole) {
+	m.roleMu.Lock()
+	m.Role = role
+	m.roleMu.Unlock()
 }
 
 func (m *Manager) registerWorkers(ctx context.Context, workers []string) {
