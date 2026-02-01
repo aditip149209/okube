@@ -84,6 +84,11 @@ func (e *EtcdStore) tasksPrefix() string {
 	return fmt.Sprintf("%s/tasks/", e.prefix)
 }
 
+// TasksPrefix exposes the tasks prefix for watch subscriptions.
+func (e *EtcdStore) TasksPrefix() string {
+	return e.tasksPrefix()
+}
+
 func (e *EtcdStore) taskKey(id uuid.UUID) string {
 	return fmt.Sprintf("%s/tasks/%s", e.prefix, id)
 }
@@ -162,6 +167,54 @@ func (e *EtcdStore) CreateTask(ctx context.Context, t *task.Task, workerID strin
 
 	_, err = e.client.Txn(ctx).Then(op...).Commit()
 	return err
+}
+
+// AssignPendingTask atomically assigns a pending task to the given worker by
+// transitioning its state to Scheduled and persisting the worker ID. The
+// operation succeeds only if the task is still Pending at commit time.
+func (e *EtcdStore) AssignPendingTask(ctx context.Context, t *task.Task, workerID string) (bool, error) {
+	if t == nil {
+		return false, fmt.Errorf("task cannot be nil")
+	}
+
+	// Prepare serialized values used in the conditional transaction.
+	pendingBytes, err := json.Marshal(task.Pending)
+	if err != nil {
+		return false, err
+	}
+
+	scheduledBytes, err := json.Marshal(task.Scheduled)
+	if err != nil {
+		return false, err
+	}
+
+	updated := *t
+	updated.State = task.Scheduled
+
+	taskBytes, err := json.Marshal(&updated)
+	if err != nil {
+		return false, err
+	}
+
+	workerBytes, err := json.Marshal(workerID)
+	if err != nil {
+		return false, err
+	}
+
+	txn := e.client.Txn(ctx).If(
+		clientv3.Compare(clientv3.Value(e.taskStateKey(t.ID)), "=", string(pendingBytes)),
+	).Then(
+		clientv3.OpPut(e.taskKey(t.ID), string(taskBytes)),
+		clientv3.OpPut(e.taskStateKey(t.ID), string(scheduledBytes)),
+		clientv3.OpPut(e.taskWorkerKey(t.ID), string(workerBytes)),
+	)
+
+	resp, err := txn.Commit()
+	if err != nil {
+		return false, err
+	}
+
+	return resp.Succeeded, nil
 }
 
 // GetTask retrieves a task and its worker assignment.
