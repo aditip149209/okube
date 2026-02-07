@@ -95,6 +95,7 @@ func main() {
 		SchedulerType: "epvm",
 		Store:         etcdStore,
 		Role:          manager.ManagerRoleLeader,
+		AdvertiseAddr: fmt.Sprintf("%s:%d", mhost, mport),
 	})
 	mapi := manager.Api{Address: mhost, Port: mport, Manager: m}
 

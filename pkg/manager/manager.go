@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -39,7 +40,25 @@ var ErrNotLeader = errors.New("manager: not leader")
 
 type managerInfo struct {
 	ID        string    `json:"id"`
+	Address   string    `json:"address,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+func (m *Manager) buildManagerInfo() managerInfo {
+	return managerInfo{ID: m.ID, Address: m.AdvertiseAddr, Timestamp: time.Now().UTC()}
+}
+
+func decodeManagerInfo(payload []byte) (*managerInfo, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("empty manager info payload")
+	}
+
+	var info managerInfo
+	if err := json.Unmarshal(payload, &info); err != nil {
+		return nil, err
+	}
+
+	return &info, nil
 }
 
 type Config struct {
@@ -48,12 +67,14 @@ type Config struct {
 	Store         store.Store
 	Role          ManagerRole
 	ID            string
+	AdvertiseAddr string
 	WorkerClient  WorkerCommunicator
 }
 
 type Manager struct {
 	ID             string
 	Role           ManagerRole
+	AdvertiseAddr  string
 	roleMu         sync.RWMutex
 	Pending        queue.Queue
 	Scheduler      scheduler.Scheduler
@@ -121,7 +142,7 @@ func (m *Manager) registerManager(session *concurrency.Session) error {
 		return fmt.Errorf("etcd session is not initialized")
 	}
 
-	info := managerInfo{ID: m.ID, Timestamp: time.Now().UTC()}
+	info := m.buildManagerInfo()
 	payload, err := json.Marshal(info)
 	if err != nil {
 		return err
@@ -139,7 +160,7 @@ func (m *Manager) tryAcquireLeadership(session *concurrency.Session) bool {
 		return false
 	}
 
-	info := managerInfo{ID: m.ID, Timestamp: time.Now().UTC()}
+	info := m.buildManagerInfo()
 	payload, err := json.Marshal(info)
 	if err != nil {
 		log.Printf("Manager %s: failed to marshal leader payload: %v", m.ID, err)
@@ -188,8 +209,19 @@ func (m *Manager) watchLeaderKey(ctx context.Context, session *concurrency.Sessi
 
 	client := m.etcdStore.Client()
 	resp, err := client.Get(ctx, m.leaderKey)
-	if err == nil && (resp == nil || resp.Count == 0) {
-		m.tryAcquireLeadership(session)
+	if err == nil {
+		if resp == nil || resp.Count == 0 {
+			m.tryAcquireLeadership(session)
+		} else if len(resp.Kvs) > 0 {
+			info, decodeErr := decodeManagerInfo(resp.Kvs[0].Value)
+			if decodeErr != nil {
+				log.Printf("Manager %s: failed to decode leader info: %v", m.ID, decodeErr)
+			} else if info.ID == m.ID {
+				m.setRole(ManagerRoleLeader)
+			} else {
+				m.setRole(ManagerRoleFollower)
+			}
+		}
 	}
 
 	watchOpts := []clientv3.OpOption{}
@@ -210,8 +242,15 @@ func (m *Manager) watchLeaderKey(ctx context.Context, session *concurrency.Sessi
 				m.setRole(ManagerRoleFollower)
 				m.tryAcquireLeadership(session)
 			case mvccpb.PUT:
-				leaderID := string(ev.Kv.Value)
-				if leaderID != m.ID {
+				info, decodeErr := decodeManagerInfo(ev.Kv.Value)
+				if decodeErr != nil {
+					log.Printf("Manager %s: failed to decode leader info update: %v", m.ID, decodeErr)
+					continue
+				}
+
+				if info.ID == m.ID {
+					m.setRole(ManagerRoleLeader)
+				} else {
 					m.setRole(ManagerRoleFollower)
 				}
 			}
@@ -673,6 +712,18 @@ func NewWithConfig(cfg Config) *Manager {
 		id = defaultManagerID()
 	}
 
+	advertiseAddr := cfg.AdvertiseAddr
+	if advertiseAddr == "" {
+		advertiseAddr = os.Getenv("OKUBE_MANAGER_ADDRESS")
+	}
+	if advertiseAddr == "" {
+		host := os.Getenv("CUBE_MANAGER_HOST")
+		port := os.Getenv("CUBE_MANAGER_PORT")
+		if host != "" && port != "" {
+			advertiseAddr = fmt.Sprintf("%s:%s", host, port)
+		}
+	}
+
 	var s scheduler.Scheduler
 	switch cfg.SchedulerType {
 	case "roundrobin":
@@ -696,6 +747,7 @@ func NewWithConfig(cfg Config) *Manager {
 		Scheduler:      s,
 		WorkerClient:   wc,
 		Store:          cfg.Store,
+		AdvertiseAddr:  advertiseAddr,
 		initialWorkers: initialWorkers,
 		electionStop:   make(chan struct{}),
 	}
@@ -738,6 +790,13 @@ func (m *Manager) IsLeader() bool {
 	return m.Role == ManagerRoleLeader
 }
 
+// CurrentRole returns the manager's current role in a concurrency-safe way.
+func (m *Manager) CurrentRole() ManagerRole {
+	m.roleMu.RLock()
+	defer m.roleMu.RUnlock()
+	return m.Role
+}
+
 func (m *Manager) setRole(role ManagerRole) {
 	m.roleMu.Lock()
 	prev := m.Role
@@ -753,6 +812,65 @@ func (m *Manager) setRole(role ManagerRole) {
 	} else {
 		m.stopTaskWatch()
 	}
+}
+
+// LeaderAddress returns the advertised address of the current leader.
+// When called on the leader, it returns the local advertise address.
+// On a follower, it queries etcd for the leader metadata.
+func (m *Manager) LeaderAddress(ctx context.Context) (string, error) {
+	if m.IsLeader() {
+		if m.AdvertiseAddr == "" {
+			return "", fmt.Errorf("leader advertise address not configured")
+		}
+		return m.AdvertiseAddr, nil
+	}
+
+	if m.etcdStore == nil {
+		return "", fmt.Errorf("etcd store not configured; cannot resolve leader")
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	resp, err := m.etcdStore.Client().Get(lookupCtx, m.leaderKey)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.Count == 0 || len(resp.Kvs) == 0 {
+		return "", fmt.Errorf("no leader present")
+	}
+
+	info, err := decodeManagerInfo(resp.Kvs[0].Value)
+	if err != nil {
+		return "", err
+	}
+
+	if info.Address != "" {
+		return info.Address, nil
+	}
+
+	// Fallback: query the specific manager key for richer metadata if present.
+	managerKey := m.etcdStore.ManagerKey(info.ID)
+	managerResp, err := m.etcdStore.Client().Get(lookupCtx, managerKey)
+	if err != nil {
+		return "", err
+	}
+
+	if managerResp.Count == 0 || len(managerResp.Kvs) == 0 {
+		return "", fmt.Errorf("leader metadata missing for %s", info.ID)
+	}
+
+	managerInfo, err := decodeManagerInfo(managerResp.Kvs[0].Value)
+	if err != nil {
+		return "", err
+	}
+
+	if managerInfo.Address == "" {
+		return "", fmt.Errorf("leader address not published")
+	}
+
+	return managerInfo.Address, nil
 }
 
 func (m *Manager) registerWorkers(ctx context.Context, workers []string) {
@@ -775,10 +893,11 @@ func (m *Manager) registerWorkers(ctx context.Context, workers []string) {
 
 // manager api- this is what allows the users to interact with the okube cluster. essentially, we are building a way for the end user to interact with okube
 type Api struct {
-	Address string
-	Port    int
-	Manager *Manager
-	Router  *chi.Mux
+	Address    string
+	Port       int
+	Manager    *Manager
+	Router     *chi.Mux
+	HTTPClient *http.Client
 }
 
 type ErrResponse struct {
@@ -786,7 +905,72 @@ type ErrResponse struct {
 	Message        string `json:"message"`
 }
 
+func (a *Api) httpClient() *http.Client {
+	if a.HTTPClient != nil {
+		return a.HTTPClient
+	}
+	return http.DefaultClient
+}
+
+// forwardToLeader proxies the request to the current leader when this manager
+// is a follower. It returns true if the request was handled (proxied or a
+// redirect/error was sent), and false if the caller should continue local
+// processing.
+func (a *Api) forwardToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if a.Manager == nil || a.Manager.IsLeader() {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	leaderAddr, err := a.Manager.LeaderAddress(ctx)
+	if err != nil || leaderAddr == "" {
+		msg := "leader unavailable; cannot forward request"
+		if err != nil {
+			msg = fmt.Sprintf("leader unavailable: %v", err)
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: msg})
+		return true
+	}
+
+	targetURL := fmt.Sprintf("http://%s%s", leaderAddr, r.URL.RequestURI())
+	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL, r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: "failed to build forward request"})
+		return true
+	}
+
+	req.Header = r.Header.Clone()
+
+	resp, err := a.httpClient().Do(req)
+	if err != nil {
+		// If proxying fails, fall back to an HTTP redirect so the client can retry directly.
+		http.Redirect(w, r, targetURL, http.StatusTemporaryRedirect)
+		return true
+	}
+	defer resp.Body.Close()
+
+	for k, values := range resp.Header {
+		for _, v := range values {
+			w.Header().Add(k, v)
+		}
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	if _, copyErr := io.Copy(w, resp.Body); copyErr != nil {
+		log.Printf("Manager %s: failed to copy proxied response: %v", a.Manager.ID, copyErr)
+	}
+
+	return true
+}
+
 func (a *Api) RegisterWorkerHandler(w http.ResponseWriter, r *http.Request) {
+	if a.forwardToLeader(w, r) {
+		return
+	}
 	if !a.Manager.IsLeader() {
 		msg := "manager is follower; worker registration disabled"
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -833,6 +1017,9 @@ func (a *Api) RegisterWorkerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Api) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if a.forwardToLeader(w, r) {
+		return
+	}
 	if !a.Manager.IsLeader() {
 		msg := "manager is follower; heartbeat updates disabled"
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -871,6 +1058,9 @@ func (a *Api) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
+	if a.forwardToLeader(w, r) {
+		return
+	}
 	if !a.Manager.IsLeader() {
 		msg := "manager is follower; task creation disabled"
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -915,6 +1105,9 @@ func (a *Api) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
+	if a.forwardToLeader(w, r) {
+		return
+	}
 	if !a.Manager.IsLeader() {
 		msg := "manager is follower; task stop disabled"
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -992,8 +1185,36 @@ func (m *Manager) GetTasks() []*task.Task {
 	return tasks
 }
 
+// StatusHandler returns the current manager's role and the leader address so
+// that clients can discover the cluster topology from any node.
+func (a *Api) StatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	type statusResponse struct {
+		ManagerID     string `json:"manager_id"`
+		Role          string `json:"role"`
+		LeaderAddress string `json:"leader_address,omitempty"`
+	}
+
+	resp := statusResponse{
+		ManagerID: a.Manager.ID,
+		Role:      string(a.Manager.CurrentRole()),
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	if addr, err := a.Manager.LeaderAddress(ctx); err == nil {
+		resp.LeaderAddress = addr
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
 func (a *Api) initRouter() {
 	a.Router = chi.NewRouter()
+	a.Router.Get("/status", a.StatusHandler)
 	a.Router.Route("/tasks", func(r chi.Router) {
 		r.Post("/", a.StartTaskHandler)
 		r.Get("/", a.GetTasksHandler)
