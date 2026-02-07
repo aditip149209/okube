@@ -10,21 +10,23 @@ import (
 	"github.com/spf13/cobra"
 )
 
-
-
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "okube",
-	Short: "A brief description of your application",
-	Long: `A longer description that spans multiple lines and likely contains
-examples and usage of using your application. For example:
+	Short: "okube – a container orchestrator with HA-aware CLI",
+	Long: `okube is a lightweight container orchestrator.
 
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
-	// Run: func(cmd *cobra.Command, args []string) { },
+The CLI connects to one or more manager endpoints and automatically
+follows leader redirects so it works correctly even during failover.
+
+Use --manager to specify a comma-separated list of manager addresses
+(defaults to localhost:5556).
+
+Examples:
+  okube --manager mgr1:5556,mgr2:5557 status
+  okube run -f task.json
+  okube stop <task-id>
+  okube nodes`,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -37,15 +39,15 @@ func Execute() {
 }
 
 func init() {
-	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
+	rootCmd.PersistentFlags().StringP("manager", "m", "",
+		"Comma-separated list of manager endpoints (host:port). "+
+			"Env: OKUBE_MANAGERS. Default: localhost:5556")
 
-	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.okube.yaml)")
-
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	// Bind to environment variable as fallback.
+	if envMgr := os.Getenv("OKUBE_MANAGERS"); envMgr != "" {
+		rootCmd.PersistentFlags().Lookup("manager").DefValue = envMgr
+		_ = rootCmd.PersistentFlags().Set("manager", envMgr)
+	}
 }
 
 

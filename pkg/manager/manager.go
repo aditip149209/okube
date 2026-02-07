@@ -1212,6 +1212,32 @@ func (a *Api) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// GetNodesHandler returns all registered workers (nodes) and their heartbeat
+// status. This endpoint is readable from any manager (leader or follower)
+// because it only performs read-only queries against the shared etcd store.
+func (a *Api) GetNodesHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if a.Manager.Store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: "store not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	workers, err := a.Manager.Store.ListWorkers(ctx)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusInternalServerError, Message: fmt.Sprintf("error listing workers: %v", err)})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(workers)
+}
+
 func (a *Api) initRouter() {
 	a.Router = chi.NewRouter()
 	a.Router.Get("/status", a.StatusHandler)
@@ -1228,6 +1254,7 @@ func (a *Api) initRouter() {
 			r.Put("/heartbeat", a.HeartbeatHandler)
 		})
 	})
+	a.Router.Get("/nodes", a.GetNodesHandler)
 }
 
 func (a *Api) Start() {

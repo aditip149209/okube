@@ -26,6 +26,24 @@ const (
 	Failed
 )
 
+// String returns a human-readable name for the task state.
+func (s State) String() string {
+	switch s {
+	case Pending:
+		return "Pending"
+	case Scheduled:
+		return "Scheduled"
+	case Running:
+		return "Running"
+	case Completed:
+		return "Completed"
+	case Failed:
+		return "Failed"
+	default:
+		return "Unknown"
+	}
+}
+
 var stateTransitionMap = map[State][]State{
 	Pending:   []State{Scheduled},
 	Scheduled: []State{Scheduled, Running, Failed},
