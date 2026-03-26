@@ -7,8 +7,10 @@ import (
 	"math"
 	"time"
 
+	"github.com/aditip149209/okube/pkg/appgroup"
 	"github.com/aditip149209/okube/pkg/node"
 	"github.com/aditip149209/okube/pkg/task"
+	"github.com/aditip149209/okube/pkg/topology"
 )
 
 const (
@@ -16,9 +18,25 @@ const (
 )
 
 type Scheduler interface {
-	SelectCandidateNodes(t task.Task, nodes []*node.Node) []*node.Node
-	Score(t task.Task, nodes []*node.Node) map[string]float64
+	SelectCandidateNodes(t task.Task, nodes []*node.Node, filterCtx *FilterContext) []*node.Node
+	Score(t task.Task, nodes []*node.Node, scoreCtx *ScoreContext) map[string]float64
 	Pick(scores map[string]float64, candidates []*node.Node) *node.Node
+}
+
+// FilterContext carries optional topology/dependency metadata used by the
+// filter stage to reject invalid placements early.
+type FilterContext struct {
+	AppGroup                *appgroup.AppGroup
+	NetworkTopology         *topology.NetworkTopology
+	DependencyNodeByService map[string]string
+}
+
+// ScoreContext carries optional metadata and weights for combining network
+// and resource costs.
+type ScoreContext struct {
+	Filter         *FilterContext
+	NetworkWeight  float64
+	ResourceWeight float64
 }
 
 type RoundRobin struct {
@@ -26,11 +44,11 @@ type RoundRobin struct {
 	LastWorker int
 }
 
-func (r *RoundRobin) SelectCandidateNodes(t task.Task, nodes []*node.Node) []*node.Node {
-	return nodes
+func (r *RoundRobin) SelectCandidateNodes(t task.Task, nodes []*node.Node, filterCtx *FilterContext) []*node.Node {
+	return filterNodesByNetworkConstraints(t, nodes, filterCtx)
 }
 
-func (r *RoundRobin) Score(t task.Task, nodes []*node.Node) map[string]float64 {
+func (r *RoundRobin) Score(t task.Task, nodes []*node.Node, scoreCtx *ScoreContext) map[string]float64 {
 	nodeScores := make(map[string]float64)
 	var newWorker int
 	if r.LastWorker+1 < len(nodes) {
@@ -49,7 +67,7 @@ func (r *RoundRobin) Score(t task.Task, nodes []*node.Node) map[string]float64 {
 		}
 	}
 
-	return nodeScores
+	return applyNetworkAwareScore(t, nodes, nodeScores, scoreCtx)
 }
 
 func (r *RoundRobin) Pick(scores map[string]float64, candidates []*node.Node) *node.Node {
@@ -78,14 +96,14 @@ func checkDisk(t task.Task, diskAvailable int64) bool {
 	return t.Disk <= int(diskAvailable)
 }
 
-func (e *Epvm) SelectCandidateNodes(t task.Task, nodes []*node.Node) []*node.Node {
+func (e *Epvm) SelectCandidateNodes(t task.Task, nodes []*node.Node, filterCtx *FilterContext) []*node.Node {
 	var candidates []*node.Node
 	for node := range nodes {
 		if checkDisk(t, nodes[node].Disk-int64(nodes[node].DiskAllocated)) {
 			candidates = append(candidates, nodes[node])
 		}
 	}
-	return candidates
+	return filterNodesByNetworkConstraints(t, candidates, filterCtx)
 
 }
 
@@ -142,7 +160,13 @@ func calculateLoad(val float64, max float64) float64 {
 	return val / max
 }
 
-func (e *Epvm) Score(t task.Task, nodes []*node.Node) map[string]float64 {
+func (e *Epvm) Score(t task.Task, nodes []*node.Node, scoreCtx *ScoreContext) map[string]float64 {
+	nodeScores := e.rawResourceScores(t, nodes)
+	return applyNetworkAwareScore(t, nodes, nodeScores, scoreCtx)
+
+}
+
+func (e *Epvm) rawResourceScores(t task.Task, nodes []*node.Node) map[string]float64 {
 	nodeScores := make(map[string]float64)
 	maxJobs := 4.0
 

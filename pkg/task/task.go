@@ -55,6 +55,8 @@ var stateTransitionMap = map[State][]State{
 type Task struct {
 	ID            uuid.UUID
 	Name          string
+	AppID         string
+	ServiceID     string
 	State         State
 	Image         string
 	Memory        int

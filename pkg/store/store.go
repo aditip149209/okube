@@ -5,7 +5,9 @@ import (
 	"errors"
 	"time"
 
+	"github.com/aditip149209/okube/pkg/appgroup"
 	"github.com/aditip149209/okube/pkg/task"
+	"github.com/aditip149209/okube/pkg/topology"
 	"github.com/google/uuid"
 )
 
@@ -29,9 +31,19 @@ type TaskRecord struct {
 type Store interface {
 	CreateTask(ctx context.Context, t *task.Task, workerID string) error
 	GetTask(ctx context.Context, id uuid.UUID) (*task.Task, string, error)
+	GetNodeOfTask(ctx context.Context, id uuid.UUID) (string, error)
 	UpdateTaskState(ctx context.Context, t *task.Task, workerID string) error
 	ListTasks(ctx context.Context) ([]TaskRecord, error)
 	RegisterWorker(ctx context.Context, worker Worker) error
 	ListWorkers(ctx context.Context) ([]Worker, error)
 	UpdateWorkerHeartbeat(ctx context.Context, workerID string, heartbeat time.Time) error
+
+	// AppGroup persistence
+	CreateAppGroup(ctx context.Context, ag *appgroup.AppGroup) error
+	GetAppGroup(ctx context.Context, appID string) (*appgroup.AppGroup, error)
+	ListAppGroups(ctx context.Context) ([]*appgroup.AppGroup, error)
+
+	// Network topology persistence
+	SaveNetworkTopology(ctx context.Context, nt *topology.NetworkTopology) error
+	GetNetworkTopology(ctx context.Context) (*topology.NetworkTopology, error)
 }

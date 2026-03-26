@@ -3,11 +3,14 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/aditip149209/okube/pkg/appgroup"
 	"github.com/aditip149209/okube/pkg/task"
+	"github.com/aditip149209/okube/pkg/topology"
 	"github.com/google/uuid"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -101,6 +104,10 @@ func (e *EtcdStore) taskWorkerKey(id uuid.UUID) string {
 	return fmt.Sprintf("%s/tasks/%s/worker", e.prefix, id)
 }
 
+func (e *EtcdStore) taskNodeKey(id uuid.UUID) string {
+	return fmt.Sprintf("%s/tasks/%s/node", e.prefix, id)
+}
+
 func (e *EtcdStore) workersPrefix() string {
 	return fmt.Sprintf("%s/workers/", e.prefix)
 }
@@ -111,6 +118,10 @@ func (e *EtcdStore) workerKey(id string) string {
 
 func (e *EtcdStore) workerHeartbeatKey(id string) string {
 	return fmt.Sprintf("%s/workers/%s/heartbeat", e.prefix, id)
+}
+
+func (e *EtcdStore) networkTopologyKey() string {
+	return fmt.Sprintf("%s/network/topology", e.prefix)
 }
 
 // UpdateWorkerHeartbeat persists a new heartbeat timestamp for a worker.
@@ -163,6 +174,7 @@ func (e *EtcdStore) CreateTask(ctx context.Context, t *task.Task, workerID strin
 			return err
 		}
 		op = append(op, clientv3.OpPut(e.taskWorkerKey(t.ID), string(workerBytes)))
+		op = append(op, clientv3.OpPut(e.taskNodeKey(t.ID), string(workerBytes)))
 	}
 
 	_, err = e.client.Txn(ctx).Then(op...).Commit()
@@ -207,6 +219,7 @@ func (e *EtcdStore) AssignPendingTask(ctx context.Context, t *task.Task, workerI
 		clientv3.OpPut(e.taskKey(t.ID), string(taskBytes)),
 		clientv3.OpPut(e.taskStateKey(t.ID), string(scheduledBytes)),
 		clientv3.OpPut(e.taskWorkerKey(t.ID), string(workerBytes)),
+		clientv3.OpPut(e.taskNodeKey(t.ID), string(workerBytes)),
 	)
 
 	resp, err := txn.Commit()
@@ -258,7 +271,45 @@ func (e *EtcdStore) GetTask(ctx context.Context, id uuid.UUID) (*task.Task, stri
 		}
 	}
 
+	if workerID == "" {
+		nodeID, err := e.GetNodeOfTask(ctx, id)
+		if err == nil {
+			workerID = nodeID
+		} else if !errors.Is(err, ErrNotFound) {
+			return nil, "", err
+		}
+	}
+
 	return &t, workerID, nil
+}
+
+// GetNodeOfTask returns the assigned node for a task from /tasks/<taskID>/node.
+func (e *EtcdStore) GetNodeOfTask(ctx context.Context, id uuid.UUID) (string, error) {
+	resp, err := e.client.Get(ctx, e.taskNodeKey(id))
+	if err != nil {
+		return "", err
+	}
+
+	if resp.Count == 0 {
+		// Backward compatibility for older data written to /worker only.
+		resp, err = e.client.Get(ctx, e.taskWorkerKey(id))
+		if err != nil {
+			return "", err
+		}
+		if resp.Count == 0 {
+			return "", ErrNotFound
+		}
+	}
+
+	var nodeID string
+	if err := json.Unmarshal(resp.Kvs[0].Value, &nodeID); err != nil {
+		return "", err
+	}
+	if nodeID == "" {
+		return "", ErrNotFound
+	}
+
+	return nodeID, nil
 }
 
 // UpdateTaskState updates a task's state and optional worker assignment.
@@ -300,6 +351,7 @@ func (e *EtcdStore) UpdateTaskState(ctx context.Context, t *task.Task, workerID 
 			return err
 		}
 		op = append(op, clientv3.OpPut(e.taskWorkerKey(updated.ID), string(workerBytes)))
+		op = append(op, clientv3.OpPut(e.taskNodeKey(updated.ID), string(workerBytes)))
 	}
 
 	_, err = e.client.Txn(ctx).Then(op...).Commit()
@@ -355,6 +407,12 @@ func (e *EtcdStore) ListTasks(ctx context.Context) ([]TaskRecord, error) {
 					return nil, err
 				}
 				meta.worker = w
+			case "node":
+				var n string
+				if err := json.Unmarshal(kv.Value, &n); err != nil {
+					return nil, err
+				}
+				meta.worker = n
 			}
 		}
 	}
@@ -449,4 +507,129 @@ func (e *EtcdStore) ListWorkers(ctx context.Context) ([]Worker, error) {
 	}
 
 	return workers, nil
+}
+
+// ---------------------------------------------------------------------------
+// AppGroup persistence
+// ---------------------------------------------------------------------------
+
+func (e *EtcdStore) appGroupsPrefix() string {
+	return fmt.Sprintf("%s/appgroups/", e.prefix)
+}
+
+func (e *EtcdStore) appGroupKey(appID string) string {
+	return fmt.Sprintf("%s/appgroups/%s", e.prefix, appID)
+}
+
+// CreateAppGroup validates the dependency graph and persists the AppGroup.
+// Validation ensures all edge endpoints reference known services and the
+// graph is acyclic (performed by appgroup.NewAppGroup).
+func (e *EtcdStore) CreateAppGroup(ctx context.Context, ag *appgroup.AppGroup) error {
+	if ag == nil {
+		return fmt.Errorf("appgroup cannot be nil")
+	}
+	if ag.AppID == "" {
+		return fmt.Errorf("appgroup AppID cannot be empty")
+	}
+
+	// Re-validate by constructing through NewAppGroup (checks edge validity
+	// and cycle-freedom). We don't need the returned value; we just want the
+	// error if the graph is invalid.
+	if _, err := appgroup.NewAppGroup(ag.AppID, ag.Services, ag.Edges); err != nil {
+		return fmt.Errorf("invalid appgroup: %w", err)
+	}
+
+	data, err := json.Marshal(ag)
+	if err != nil {
+		return err
+	}
+
+	_, err = e.client.Put(ctx, e.appGroupKey(ag.AppID), string(data))
+	return err
+}
+
+// GetAppGroup retrieves a single AppGroup by its AppID.
+func (e *EtcdStore) GetAppGroup(ctx context.Context, appID string) (*appgroup.AppGroup, error) {
+	resp, err := e.client.Get(ctx, e.appGroupKey(appID))
+	if err != nil {
+		return nil, err
+	}
+	if resp.Count == 0 {
+		return nil, ErrNotFound
+	}
+
+	return unmarshalAppGroup(resp.Kvs[0].Value)
+}
+
+// ListAppGroups returns every persisted AppGroup.
+func (e *EtcdStore) ListAppGroups(ctx context.Context) ([]*appgroup.AppGroup, error) {
+	resp, err := e.client.Get(ctx, e.appGroupsPrefix(), clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+
+	groups := make([]*appgroup.AppGroup, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		ag, err := unmarshalAppGroup(kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, ag)
+	}
+
+	return groups, nil
+}
+
+// unmarshalAppGroup deserializes JSON into an AppGroup, rebuilding its
+// internal adjacency maps by passing through NewAppGroup.
+func unmarshalAppGroup(data []byte) (*appgroup.AppGroup, error) {
+	var raw struct {
+		AppID    string                    `json:"appID"`
+		Services []string                  `json:"services"`
+		Edges    []appgroup.DependencyEdge `json:"edges"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+
+	return appgroup.NewAppGroup(raw.AppID, raw.Services, raw.Edges)
+}
+
+// SaveNetworkTopology persists the cluster network topology snapshot at a
+// fixed key so all managers read the same cost model. Repeated writes replace
+// the existing snapshot, enabling dynamic updates.
+func (e *EtcdStore) SaveNetworkTopology(ctx context.Context, nt *topology.NetworkTopology) error {
+	if nt == nil {
+		return fmt.Errorf("network topology cannot be nil")
+	}
+
+	data, err := json.Marshal(nt)
+	if err != nil {
+		return err
+	}
+
+	_, err = e.client.Put(ctx, e.networkTopologyKey(), string(data))
+	return err
+}
+
+// GetNetworkTopology returns the latest persisted cluster network topology.
+func (e *EtcdStore) GetNetworkTopology(ctx context.Context) (*topology.NetworkTopology, error) {
+	resp, err := e.client.Get(ctx, e.networkTopologyKey())
+	if err != nil {
+		return nil, err
+	}
+	if resp.Count == 0 {
+		return nil, ErrNotFound
+	}
+
+	return unmarshalNetworkTopology(resp.Kvs[0].Value)
+}
+
+func unmarshalNetworkTopology(data []byte) (*topology.NetworkTopology, error) {
+	var nt topology.NetworkTopology
+	if err := json.Unmarshal(data, &nt); err != nil {
+		return nil, err
+	}
+
+	return &nt, nil
 }

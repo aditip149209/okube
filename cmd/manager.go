@@ -24,6 +24,10 @@ for high availability.`,
 		etcdEndpoints, _ := cmd.Flags().GetString("etcd-endpoints")
 		workers, _ := cmd.Flags().GetString("workers")
 		id, _ := cmd.Flags().GetString("id")
+		queueSortStrategy, _ := cmd.Flags().GetString("queue-sort")
+		topologyProbeMode, _ := cmd.Flags().GetString("topology-probe-mode")
+		topologyProbeInterval, _ := cmd.Flags().GetDuration("topology-probe-interval")
+		topologyProbeSampleSize, _ := cmd.Flags().GetInt("topology-probe-sample-size")
 
 		endpoints := strings.Split(etcdEndpoints, ",")
 		etcdStore, err := store.NewEtcdStore(store.EtcdConfig{
@@ -46,11 +50,15 @@ for high availability.`,
 
 		advertiseAddr := fmt.Sprintf("%s:%d", host, port)
 		m := manager.NewWithConfig(manager.Config{
-			Workers:       workerList,
-			SchedulerType: schedulerType,
-			Store:         etcdStore,
-			ID:            id,
-			AdvertiseAddr: advertiseAddr,
+			Workers:                 workerList,
+			SchedulerType:           schedulerType,
+			QueueSortStrategy:       queueSortStrategy,
+			TopologyProbeMode:       topologyProbeMode,
+			TopologyProbeInterval:   topologyProbeInterval,
+			TopologyProbeSampleSize: topologyProbeSampleSize,
+			Store:                   etcdStore,
+			ID:                      id,
+			AdvertiseAddr:           advertiseAddr,
 		})
 
 		go m.UpdateTasks()
@@ -67,6 +75,10 @@ func init() {
 	managerCmd.Flags().StringP("host", "H", "0.0.0.0", "Hostname or IP address to bind to")
 	managerCmd.Flags().IntP("port", "p", 5556, "Port on which to listen")
 	managerCmd.Flags().String("scheduler", "roundrobin", "Scheduler type (roundrobin or epvm)")
+	managerCmd.Flags().String("queue-sort", "kahn", "Queue sort strategy (kahn, reversekahn, alternatekahn)")
+	managerCmd.Flags().String("topology-probe-mode", "full-mesh", "Topology probe mode (full-mesh or sampled)")
+	managerCmd.Flags().Duration("topology-probe-interval", 30*time.Second, "Interval between topology probe updates")
+	managerCmd.Flags().Int("topology-probe-sample-size", 2, "Per-node sample count when topology probe mode is sampled")
 	managerCmd.Flags().String("etcd-endpoints", "localhost:2379", "Comma-separated etcd endpoints")
 	managerCmd.Flags().StringP("workers", "w", "", "Comma-separated initial worker addresses (host:port)")
 	managerCmd.Flags().String("id", "", "Manager ID (defaults to hostname or random UUID)")

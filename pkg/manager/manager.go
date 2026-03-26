@@ -17,6 +17,7 @@ import (
 	"github.com/aditip149209/okube/pkg/scheduler"
 	"github.com/aditip149209/okube/pkg/store"
 	"github.com/aditip149209/okube/pkg/task"
+	"github.com/aditip149209/okube/pkg/topology"
 	"github.com/docker/go-connections/nat"
 	"github.com/go-chi/chi"
 	"github.com/golang-collections/collections/queue"
@@ -62,31 +63,37 @@ func decodeManagerInfo(payload []byte) (*managerInfo, error) {
 }
 
 type Config struct {
-	Workers       []string
-	SchedulerType string
-	Store         store.Store
-	Role          ManagerRole
-	ID            string
-	AdvertiseAddr string
-	WorkerClient  WorkerCommunicator
+	Workers                 []string
+	SchedulerType           string
+	QueueSortStrategy       string
+	TopologyProbeMode       string
+	TopologyProbeInterval   time.Duration
+	TopologyProbeSampleSize int
+	Store                   store.Store
+	Role                    ManagerRole
+	ID                      string
+	AdvertiseAddr           string
+	WorkerClient            WorkerCommunicator
 }
 
 type Manager struct {
-	ID             string
-	Role           ManagerRole
-	AdvertiseAddr  string
-	roleMu         sync.RWMutex
-	Pending        queue.Queue
-	Scheduler      scheduler.Scheduler
-	WorkerClient   WorkerCommunicator
-	Store          store.Store
-	initialWorkers []string
-	etcdStore      *store.EtcdStore
-	etcdSession    *concurrency.Session
-	leaderKey      string
-	managerKey     string
-	electionStop   chan struct{}
-	taskWatchStop  context.CancelFunc
+	ID                  string
+	Role                ManagerRole
+	AdvertiseAddr       string
+	roleMu              sync.RWMutex
+	Pending             queue.Queue
+	Scheduler           scheduler.Scheduler
+	WorkerClient        WorkerCommunicator
+	Store               store.Store
+	initialWorkers      []string
+	etcdStore           *store.EtcdStore
+	etcdSession         *concurrency.Session
+	leaderKey           string
+	managerKey          string
+	electionStop        chan struct{}
+	taskWatchStop       context.CancelFunc
+	topologyUpdater     *topology.Updater
+	topologyUpdaterStop context.CancelFunc
 }
 
 func (m *Manager) startLeaderElection() {
@@ -280,6 +287,63 @@ func (m *Manager) stopTaskWatch() {
 	}
 }
 
+func (m *Manager) startTopologyUpdater() {
+	if m.topologyUpdater == nil {
+		return
+	}
+
+	m.stopTopologyUpdater()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.topologyUpdaterStop = cancel
+	go m.topologyUpdater.Run(ctx)
+}
+
+func (m *Manager) stopTopologyUpdater() {
+	if m.topologyUpdaterStop != nil {
+		m.topologyUpdaterStop()
+		m.topologyUpdaterStop = nil
+	}
+}
+
+func (m *Manager) listTopologyNodes(ctx context.Context) ([]topology.NodeTarget, error) {
+	workers, err := m.activeWorkers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes := make([]topology.NodeTarget, 0, len(workers))
+	for _, w := range workers {
+		nodes = append(nodes, topology.NodeTarget{ID: w.ID, Address: w.Address})
+	}
+	return nodes, nil
+}
+
+func (m *Manager) probeLatency(ctx context.Context, from topology.NodeTarget, to topology.NodeTarget) (float64, error) {
+	if from.ID == to.ID {
+		return 0, nil
+	}
+
+	url := fmt.Sprintf("http://%s/stats", to.Address)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("probe failed with status %d", resp.StatusCode)
+	}
+
+	return float64(time.Since(start)) / float64(time.Millisecond), nil
+}
+
 func (m *Manager) watchPendingTasks(ctx context.Context) {
 	// Catch up on any pending tasks that already exist before the watch starts.
 	m.schedulePendingSnapshot()
@@ -320,7 +384,8 @@ func (m *Manager) watchPendingTasks(ctx context.Context) {
 					continue
 				}
 
-				go m.trySchedulePendingTask(taskID)
+				_ = taskID // task id parse keeps key validation logic; snapshot handles ordering.
+				go m.schedulePendingSnapshot()
 			}
 		}
 	}
@@ -350,10 +415,34 @@ func (m *Manager) schedulePendingSnapshot() {
 		return
 	}
 
+	appGroups, err := m.Store.ListAppGroups(ctx)
+	if err != nil {
+		log.Printf("Manager %s: unable to list appgroups for queue sorting: %v", m.ID, err)
+		appGroups = nil
+	}
+
+	pendingTasks := make([]*task.Task, 0)
+
 	for _, rec := range records {
 		if rec.Task != nil && rec.Task.State == task.Pending {
-			go m.trySchedulePendingTask(rec.Task.ID)
+			pendingTasks = append(pendingTasks, rec.Task)
 		}
+	}
+
+	if len(pendingTasks) == 0 {
+		return
+	}
+
+	sorted := pendingTasks
+	if qs, ok := m.Scheduler.(scheduler.QueueSortCapable); ok {
+		sorted = qs.QueueSort(pendingTasks, appGroups)
+	}
+
+	for _, t := range sorted {
+		if t == nil {
+			continue
+		}
+		m.trySchedulePendingTask(t.ID)
 	}
 }
 
@@ -401,6 +490,15 @@ func (m *Manager) trySchedulePendingTask(taskID uuid.UUID) {
 		return
 	}
 
+	reserveCtx, reserveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = m.reserveBandwidthForTaskPlacement(reserveCtx, *t, worker.ID)
+	reserveCancel()
+	if err != nil {
+		log.Printf("Manager %s: failed bandwidth reservation for task %s on worker %s: %v", m.ID, t.ID, worker.ID, err)
+		m.resetTaskToPending(*t)
+		return
+	}
+
 	t.State = task.Scheduled
 	m.dispatchTaskToWorker(*t, worker)
 }
@@ -420,12 +518,22 @@ func (m *Manager) dispatchTaskToWorker(t task.Task, worker *store.Worker) {
 	_, errResp, err := m.WorkerClient.StartTask(worker.Address, te)
 	if err != nil {
 		log.Printf("Manager %s: dispatch to worker %s for task %s failed: %v", m.ID, worker.ID, t.ID, err)
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if releaseErr := m.releaseBandwidthForTaskPlacement(releaseCtx, t, worker.ID); releaseErr != nil {
+			log.Printf("Manager %s: failed to release bandwidth for task %s after dispatch error: %v", m.ID, t.ID, releaseErr)
+		}
+		releaseCancel()
 		m.resetTaskToPending(t)
 		return
 	}
 
 	if errResp != nil {
 		log.Printf("Manager %s: worker %s rejected task %s: %s", m.ID, worker.ID, t.ID, errResp.Message)
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if releaseErr := m.releaseBandwidthForTaskPlacement(releaseCtx, t, worker.ID); releaseErr != nil {
+			log.Printf("Manager %s: failed to release bandwidth for task %s after worker rejection: %v", m.ID, t.ID, releaseErr)
+		}
+		releaseCancel()
 		m.resetTaskToPending(t)
 		return
 	}
@@ -495,12 +603,18 @@ func (m *Manager) SelectWorker(ctx context.Context, t task.Task) (*store.Worker,
 		nodes = append(nodes, n)
 	}
 
-	candidates := m.Scheduler.SelectCandidateNodes(t, nodes)
+	filterCtx := m.buildFilterContext(ctx, t)
+	candidates := m.Scheduler.SelectCandidateNodes(t, nodes, filterCtx)
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no available candidates match resource request for task %v", t.ID)
 	}
 
-	scores := m.Scheduler.Score(t, candidates)
+	scoreCtx := &scheduler.ScoreContext{
+		Filter:         filterCtx,
+		NetworkWeight:  0.7,
+		ResourceWeight: 0.3,
+	}
+	scores := m.Scheduler.Score(t, candidates, scoreCtx)
 	selectedNode := m.Scheduler.Pick(scores, candidates)
 	if selectedNode == nil {
 		return nil, fmt.Errorf("scheduler failed to pick a worker for task %v", t.ID)
@@ -513,6 +627,168 @@ func (m *Manager) SelectWorker(ctx context.Context, t task.Task) (*store.Worker,
 
 	return &selectedWorker, nil
 
+}
+
+func (m *Manager) buildFilterContext(ctx context.Context, t task.Task) *scheduler.FilterContext {
+	if m.Store == nil || t.AppID == "" {
+		return nil
+	}
+
+	serviceID := taskServiceID(&t)
+	if serviceID == "" {
+		return nil
+	}
+
+	ag, err := m.Store.GetAppGroup(ctx, t.AppID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			log.Printf("Manager %s: failed to load appgroup %s for filter context: %v", m.ID, t.AppID, err)
+		}
+		return nil
+	}
+
+	topo, err := m.Store.GetNetworkTopology(ctx)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			log.Printf("Manager %s: failed to load network topology for filter context: %v", m.ID, err)
+		}
+		return nil
+	}
+
+	records, err := m.Store.ListTasks(ctx)
+	if err != nil {
+		log.Printf("Manager %s: failed to list tasks for filter context: %v", m.ID, err)
+		return nil
+	}
+
+	dependencyNodeByService := make(map[string]string)
+	for _, rec := range records {
+		if rec.Task == nil || rec.Task.AppID != t.AppID {
+			continue
+		}
+		if rec.Task.State != task.Running && rec.Task.State != task.Scheduled {
+			continue
+		}
+
+		sid := taskServiceID(rec.Task)
+		if sid == "" {
+			continue
+		}
+
+		nodeID, err := m.Store.GetNodeOfTask(ctx, rec.Task.ID)
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				log.Printf("Manager %s: failed to read node assignment for task %s: %v", m.ID, rec.Task.ID, err)
+			}
+			continue
+		}
+		dependencyNodeByService[sid] = nodeID
+	}
+
+	return &scheduler.FilterContext{
+		AppGroup:                ag,
+		NetworkTopology:         topo,
+		DependencyNodeByService: dependencyNodeByService,
+	}
+}
+
+func taskServiceID(t *task.Task) string {
+	if t == nil {
+		return ""
+	}
+	if t.ServiceID != "" {
+		return t.ServiceID
+	}
+	return t.Name
+}
+
+func (m *Manager) reserveBandwidthForTaskPlacement(ctx context.Context, t task.Task, candidateNodeID string) error {
+	if m.Store == nil || t.AppID == "" {
+		return nil
+	}
+
+	filterCtx := m.buildFilterContext(ctx, t)
+	if filterCtx == nil || filterCtx.AppGroup == nil || filterCtx.NetworkTopology == nil {
+		return nil
+	}
+
+	serviceID := taskServiceID(&t)
+	if serviceID == "" {
+		return nil
+	}
+
+	edges := filterCtx.AppGroup.GetDependencies(serviceID)
+	type reservation struct {
+		nodeA  string
+		nodeB  string
+		amount float64
+	}
+	reserved := make([]reservation, 0)
+
+	for _, edge := range edges {
+		if edge.MinBandwidth == nil || *edge.MinBandwidth <= 0 {
+			continue
+		}
+
+		depNodeID, ok := filterCtx.DependencyNodeByService[edge.To]
+		if !ok || depNodeID == "" || depNodeID == candidateNodeID {
+			continue
+		}
+
+		if ok := filterCtx.NetworkTopology.ReserveBandwidth(candidateNodeID, depNodeID, *edge.MinBandwidth); !ok {
+			for _, r := range reserved {
+				filterCtx.NetworkTopology.ReleaseBandwidth(r.nodeA, r.nodeB, r.amount)
+			}
+			return fmt.Errorf("insufficient available bandwidth from %s to %s", candidateNodeID, depNodeID)
+		}
+
+		reserved = append(reserved, reservation{nodeA: candidateNodeID, nodeB: depNodeID, amount: *edge.MinBandwidth})
+	}
+
+	if len(reserved) == 0 {
+		return nil
+	}
+
+	return m.Store.SaveNetworkTopology(ctx, filterCtx.NetworkTopology)
+}
+
+func (m *Manager) releaseBandwidthForTaskPlacement(ctx context.Context, t task.Task, candidateNodeID string) error {
+	if m.Store == nil || t.AppID == "" {
+		return nil
+	}
+
+	filterCtx := m.buildFilterContext(ctx, t)
+	if filterCtx == nil || filterCtx.AppGroup == nil || filterCtx.NetworkTopology == nil {
+		return nil
+	}
+
+	serviceID := taskServiceID(&t)
+	if serviceID == "" {
+		return nil
+	}
+
+	edges := filterCtx.AppGroup.GetDependencies(serviceID)
+	releasedAny := false
+	for _, edge := range edges {
+		if edge.MinBandwidth == nil || *edge.MinBandwidth <= 0 {
+			continue
+		}
+
+		depNodeID, ok := filterCtx.DependencyNodeByService[edge.To]
+		if !ok || depNodeID == "" || depNodeID == candidateNodeID {
+			continue
+		}
+
+		if filterCtx.NetworkTopology.ReleaseBandwidth(candidateNodeID, depNodeID, *edge.MinBandwidth) {
+			releasedAny = true
+		}
+	}
+
+	if !releasedAny {
+		return nil
+	}
+
+	return m.Store.SaveNetworkTopology(ctx, filterCtx.NetworkTopology)
 }
 
 func (m *Manager) updateTasks() {
@@ -724,14 +1000,15 @@ func NewWithConfig(cfg Config) *Manager {
 		}
 	}
 
-	var s scheduler.Scheduler
-	switch cfg.SchedulerType {
-	case "roundrobin":
-		s = &scheduler.RoundRobin{Name: "roundrobin"}
-	case "epvm":
-		s = &scheduler.Epvm{Name: "epvm"}
-	default:
-		s = &scheduler.RoundRobin{Name: "roundrobin"}
+	s := scheduler.NewPipelineScheduler(cfg.SchedulerType, cfg.QueueSortStrategy)
+	probeMode := topology.ParseProbeMode(cfg.TopologyProbeMode)
+	probeInterval := cfg.TopologyProbeInterval
+	if probeInterval <= 0 {
+		probeInterval = 30 * time.Second
+	}
+	probeSampleSize := cfg.TopologyProbeSampleSize
+	if probeSampleSize <= 0 {
+		probeSampleSize = 2
 	}
 
 	wc := cfg.WorkerClient
@@ -750,6 +1027,17 @@ func NewWithConfig(cfg Config) *Manager {
 		AdvertiseAddr:  advertiseAddr,
 		initialWorkers: initialWorkers,
 		electionStop:   make(chan struct{}),
+	}
+
+	if m.Store != nil {
+		m.topologyUpdater = topology.NewUpdater(topology.UpdaterConfig{
+			Store:      m.Store,
+			ListNodes:  m.listTopologyNodes,
+			Probe:      m.probeLatency,
+			Mode:       probeMode,
+			Interval:   probeInterval,
+			SampleSize: probeSampleSize,
+		})
 	}
 
 	if etcdStore, ok := cfg.Store.(*store.EtcdStore); ok {
@@ -809,8 +1097,10 @@ func (m *Manager) setRole(role ManagerRole) {
 
 	if role == ManagerRoleLeader {
 		m.startTaskWatch()
+		m.startTopologyUpdater()
 	} else {
 		m.stopTaskWatch()
+		m.stopTopologyUpdater()
 	}
 }
 
