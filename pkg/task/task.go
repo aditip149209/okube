@@ -74,6 +74,9 @@ type Task struct {
 	//if the developer wrote a bad health check, then our manager will not make good decisions
 	//the manager relies completely on the url, and the url is only as smart as the dev who wrote it.
 	RestartCount int
+	Env          []string `json:"env,omitempty"`
+	Volumes      []string `json:"volumes,omitempty"`
+	Command      []string `json:"command,omitempty"`
 }
 
 type TaskEvent struct {
@@ -96,6 +99,7 @@ type Config struct {
 	Disk          int64
 	Env           []string
 	RestartPolicy string
+	Volumes       []string
 }
 
 func NewConfig(t *Task) *Config {
@@ -106,6 +110,9 @@ func NewConfig(t *Task) *Config {
 		Disk:          int64(t.Disk),
 		RestartPolicy: t.RestartPolicy,
 		ExposedPorts:  t.ExposedPorts,
+		Env:           t.Env,
+		Volumes:       t.Volumes,
+		Cmd:           t.Command,
 	}
 }
 
@@ -175,12 +182,14 @@ func (d *Docker) Run() DockerResult {
 		Tty:          false,
 		Env:          d.Config.Env,
 		ExposedPorts: d.Config.ExposedPorts,
+		Cmd:          d.Config.Cmd,
 	}
 
 	hc := container.HostConfig{
 		RestartPolicy:   rp,
 		Resources:       r,
 		PublishAllPorts: true,
+		Binds:           d.Config.Volumes,
 	}
 
 	resp, err := d.Client.ContainerCreate(ctx, &cc, &hc, nil, nil, d.Config.Name)

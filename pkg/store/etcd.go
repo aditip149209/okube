@@ -633,3 +633,100 @@ func unmarshalNetworkTopology(data []byte) (*topology.NetworkTopology, error) {
 
 	return &nt, nil
 }
+
+// ---------------------------------------------------------------------------
+// App persistence
+// ---------------------------------------------------------------------------
+
+func (e *EtcdStore) appsPrefix() string {
+	return fmt.Sprintf("%s/apps/", e.prefix)
+}
+
+func (e *EtcdStore) appKey(name string) string {
+	return fmt.Sprintf("%s/apps/%s", e.prefix, name)
+}
+
+// CreateApp persists a new App. Returns an error if the app already exists.
+func (e *EtcdStore) CreateApp(ctx context.Context, app *App) error {
+	if app == nil {
+		return fmt.Errorf("app cannot be nil")
+	}
+	if app.Name == "" {
+		return fmt.Errorf("app name cannot be empty")
+	}
+
+	data, err := json.Marshal(app)
+	if err != nil {
+		return err
+	}
+
+	// Only create if the key does not exist yet.
+	txn := e.client.Txn(ctx).If(
+		clientv3.Compare(clientv3.CreateRevision(e.appKey(app.Name)), "=", 0),
+	).Then(
+		clientv3.OpPut(e.appKey(app.Name), string(data)),
+	)
+
+	resp, err := txn.Commit()
+	if err != nil {
+		return err
+	}
+	if !resp.Succeeded {
+		return fmt.Errorf("app %q already exists", app.Name)
+	}
+	return nil
+}
+
+// GetApp retrieves an App by name.
+func (e *EtcdStore) GetApp(ctx context.Context, name string) (*App, error) {
+	resp, err := e.client.Get(ctx, e.appKey(name))
+	if err != nil {
+		return nil, err
+	}
+	if resp.Count == 0 {
+		return nil, ErrNotFound
+	}
+
+	var app App
+	if err := json.Unmarshal(resp.Kvs[0].Value, &app); err != nil {
+		return nil, err
+	}
+	return &app, nil
+}
+
+// UpdateApp overwrites the stored App data.
+func (e *EtcdStore) UpdateApp(ctx context.Context, app *App) error {
+	if app == nil || app.Name == "" {
+		return fmt.Errorf("app or name cannot be nil/empty")
+	}
+	data, err := json.Marshal(app)
+	if err != nil {
+		return err
+	}
+	_, err = e.client.Put(ctx, e.appKey(app.Name), string(data))
+	return err
+}
+
+// ListApps returns all persisted Apps.
+func (e *EtcdStore) ListApps(ctx context.Context) ([]*App, error) {
+	resp, err := e.client.Get(ctx, e.appsPrefix(), clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+
+	apps := make([]*App, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		var app App
+		if err := json.Unmarshal(kv.Value, &app); err != nil {
+			return nil, err
+		}
+		apps = append(apps, &app)
+	}
+	return apps, nil
+}
+
+// DeleteApp removes an App from the store.
+func (e *EtcdStore) DeleteApp(ctx context.Context, name string) error {
+	_, err := e.client.Delete(ctx, e.appKey(name))
+	return err
+}

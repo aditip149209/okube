@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/aditip149209/okube/pkg/cli"
+	"github.com/aditip149209/okube/pkg/manifest"
 	"github.com/aditip149209/okube/pkg/task"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -231,11 +232,144 @@ func managerEndpoints() []string {
 	return eps
 }
 
+// ---------------------------------------------------------------------------
+// deploy / apps / delete commands
+// ---------------------------------------------------------------------------
+
+var deployCmd = &cobra.Command{
+	Use:   "deploy",
+	Short: "Deploy a multi-service application from a manifest.",
+	Long: `Deploy an application defined in a YAML manifest file. Services are
+started in dependency order with automatic service discovery via env vars.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		filename, _ := cmd.Flags().GetString("filename")
+		if filename == "" {
+			fmt.Fprintln(os.Stderr, "Error: --filename is required")
+			os.Exit(1)
+		}
+
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading file %s: %v\n", filename, err)
+			os.Exit(1)
+		}
+
+		// Validate locally first.
+		if _, err := manifest.ParseManifest(data); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid manifest: %v\n", err)
+			os.Exit(1)
+		}
+
+		client := cli.NewClient(managerEndpoints())
+		fmt.Println("Deploying application...")
+
+		resp, err := client.DoRaw(http.MethodPost, "/apps", data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		body, _ := cli.ReadBody(resp)
+
+		if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+			var result struct {
+				App      string `json:"app"`
+				Status   string `json:"status"`
+				Services map[string]struct {
+					TaskID   string `json:"task_id"`
+					WorkerID string `json:"worker_id"`
+					Address  string `json:"address"`
+				} `json:"services"`
+			}
+			if json.Unmarshal([]byte(body), &result) == nil {
+				fmt.Printf("\nApplication %q deployed — status: %s\n\n", result.App, result.Status)
+				tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(tw, "SERVICE\tADDRESS\tTASK ID\tWORKER")
+				for name, info := range result.Services {
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", name, info.Address, info.TaskID, info.WorkerID)
+				}
+				tw.Flush()
+			} else {
+				fmt.Println(body)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "Deploy failed (HTTP %d): %s\n", resp.StatusCode, body)
+			os.Exit(1)
+		}
+	},
+}
+
+var appsCmd = &cobra.Command{
+	Use:   "apps",
+	Short: "List deployed applications.",
+	Run: func(cmd *cobra.Command, args []string) {
+		client := cli.NewClient(managerEndpoints())
+		resp, err := client.Do(http.MethodGet, "/apps", nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		var apps []struct {
+			Name         string            `json:"name"`
+			ServiceTasks map[string]string `json:"service_tasks"`
+			Status       string            `json:"status"`
+		}
+		if err := cli.ReadJSON(resp, &apps); err != nil {
+			log.Fatalf("Error decoding apps: %v", err)
+		}
+
+		if len(apps) == 0 {
+			fmt.Println("No applications deployed.")
+			return
+		}
+
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "APP NAME\tSTATUS\tSERVICES")
+		for _, a := range apps {
+			svcNames := make([]string, 0, len(a.ServiceTasks))
+			for name := range a.ServiceTasks {
+				svcNames = append(svcNames, name)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", a.Name, a.Status, strings.Join(svcNames, ", "))
+		}
+		tw.Flush()
+	},
+}
+
+var deleteAppCmd = &cobra.Command{
+	Use:   "delete [app-name]",
+	Short: "Delete (teardown) a deployed application.",
+	Long:  `Stop all services in the application in reverse dependency order and remove the app record.`,
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		appName := args[0]
+		client := cli.NewClient(managerEndpoints())
+		resp, err := client.Do(http.MethodDelete, "/apps/"+appName, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+			fmt.Printf("Application %q teardown initiated.\n", appName)
+		} else {
+			body, _ := cli.ReadBody(resp)
+			fmt.Fprintf(os.Stderr, "Failed to delete app (HTTP %d): %s\n", resp.StatusCode, body)
+			os.Exit(1)
+		}
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(nodesCmd)
+	rootCmd.AddCommand(deployCmd)
+	rootCmd.AddCommand(appsCmd)
+	rootCmd.AddCommand(deleteAppCmd)
 
 	runCmd.Flags().StringP("filename", "f", "", "Path to a JSON task definition file")
+	deployCmd.Flags().StringP("filename", "f", "", "Path to a YAML manifest file")
 }

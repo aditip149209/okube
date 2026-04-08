@@ -27,6 +27,13 @@ type TaskRecord struct {
 	WorkerID string     `json:"worker_id,omitempty"`
 }
 
+// App represents a deployed multi-service application.
+type App struct {
+	Name         string            `json:"name"`
+	ServiceTasks map[string]string `json:"service_tasks"` // service name → task ID
+	Status       string            `json:"status"`        // deploying, running, stopping, stopped
+}
+
 // Store defines the contract for persisting tasks and workers.
 type Store interface {
 	CreateTask(ctx context.Context, t *task.Task, workerID string) error
@@ -46,4 +53,11 @@ type Store interface {
 	// Network topology persistence
 	SaveNetworkTopology(ctx context.Context, nt *topology.NetworkTopology) error
 	GetNetworkTopology(ctx context.Context) (*topology.NetworkTopology, error)
+
+	// App persistence
+	CreateApp(ctx context.Context, app *App) error
+	GetApp(ctx context.Context, name string) (*App, error)
+	UpdateApp(ctx context.Context, app *App) error
+	ListApps(ctx context.Context) ([]*App, error)
+	DeleteApp(ctx context.Context, name string) error
 }

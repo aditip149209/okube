@@ -120,3 +120,22 @@ func ReadBody(resp *http.Response) (string, error) {
 	b, err := io.ReadAll(resp.Body)
 	return string(b), err
 }
+
+// DoRaw executes an HTTP request with raw bytes as the body (e.g. YAML).
+func (c *Client) DoRaw(method, path string, body []byte) (*http.Response, error) {
+	var lastErr error
+	for _, ep := range c.Endpoints {
+		url := normalizeEndpoint(ep) + path
+		resp, err := c.doWithRedirects(method, url, body, maxRedirects)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: %w", ep, err)
+			continue
+		}
+		return resp, nil
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("all manager endpoints failed; last error: %w", lastErr)
+	}
+	return nil, fmt.Errorf("no manager endpoints configured")
+}

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aditip149209/okube/pkg/manifest"
 	"github.com/aditip149209/okube/pkg/node"
 	"github.com/aditip149209/okube/pkg/scheduler"
 	"github.com/aditip149209/okube/pkg/store"
@@ -1528,6 +1529,400 @@ func (a *Api) GetNodesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(workers)
 }
 
+// ---------------------------------------------------------------------------
+// App deploy / list / get / delete handlers
+// ---------------------------------------------------------------------------
+
+// DeployAppHandler handles POST /apps — deploys a multi-service application
+// from a manifest definition. Services are deployed in topological order with
+// env-var-based service discovery.
+func (a *Api) DeployAppHandler(w http.ResponseWriter, r *http.Request) {
+	if a.forwardToLeader(w, r) {
+		return
+	}
+	if !a.Manager.IsLeader() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: "not leader"})
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusBadRequest, Message: "failed to read body"})
+		return
+	}
+
+	m, err := manifest.ParseManifest(body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusBadRequest, Message: fmt.Sprintf("invalid manifest: %v", err)})
+		return
+	}
+
+	result, err := a.Manager.DeployApp(r.Context(), m)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusInternalServerError, Message: fmt.Sprintf("deploy failed: %v", err)})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(result)
+}
+
+// ListAppsHandler handles GET /apps.
+func (a *Api) ListAppsHandler(w http.ResponseWriter, r *http.Request) {
+	if a.Manager.Store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	apps, err := a.Manager.Store.ListApps(ctx)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusInternalServerError, Message: err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(apps)
+}
+
+// GetAppHandler handles GET /apps/{appName}.
+func (a *Api) GetAppHandler(w http.ResponseWriter, r *http.Request) {
+	if a.Manager.Store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	appName := chi.URLParam(r, "appName")
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	app, err := a.Manager.Store.GetApp(ctx, appName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: 404, Message: "app not found"})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: 500, Message: err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(app)
+}
+
+// DeleteAppHandler handles DELETE /apps/{appName}.
+func (a *Api) DeleteAppHandler(w http.ResponseWriter, r *http.Request) {
+	if a.forwardToLeader(w, r) {
+		return
+	}
+	if !a.Manager.IsLeader() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusServiceUnavailable, Message: "not leader"})
+		return
+	}
+
+	appName := chi.URLParam(r, "appName")
+	if err := a.Manager.TeardownApp(r.Context(), appName); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: 404, Message: "app not found"})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: 500, Message: err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------------------------------------------------------------------------
+// Deploy / teardown logic
+// ---------------------------------------------------------------------------
+
+// DeployResult is the response returned after a successful app deployment.
+type DeployResult struct {
+	App      string                       `json:"app"`
+	Status   string                       `json:"status"`
+	Services map[string]DeployServiceInfo `json:"services"`
+}
+
+// DeployServiceInfo describes a deployed service's address.
+type DeployServiceInfo struct {
+	TaskID   string `json:"task_id"`
+	WorkerID string `json:"worker_id"`
+	Address  string `json:"address"` // host:port reachable from LAN
+}
+
+// DeployApp deploys a manifest's services in topological order, injecting
+// service discovery env vars for each dependency that is already running.
+func (m *Manager) DeployApp(ctx context.Context, mf *manifest.Manifest) (*DeployResult, error) {
+	if m.Store == nil {
+		return nil, errors.New("store not configured")
+	}
+
+	// Build AppGroup from manifest for topo ordering + store.
+	ag, err := manifest.ToAppGroup(mf)
+	if err != nil {
+		return nil, fmt.Errorf("building dependency graph: %w", err)
+	}
+
+	appGroupCtx, agCancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = m.Store.CreateAppGroup(appGroupCtx, ag) // best effort, may already exist
+	agCancel()
+
+	order, err := ag.TopologicalOrder()
+	if err != nil {
+		return nil, fmt.Errorf("topological sort: %w", err)
+	}
+
+	tasks := manifest.ToTasks(mf, mf.Name)
+
+	// Create App record.
+	app := &store.App{
+		Name:         mf.Name,
+		ServiceTasks: make(map[string]string),
+		Status:       "deploying",
+	}
+	appCtx, appCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := m.Store.CreateApp(appCtx, app); err != nil {
+		appCancel()
+		return nil, fmt.Errorf("creating app record: %w", err)
+	}
+	appCancel()
+
+	// Track discovered service addresses: serviceName → {host, port}
+	type svcAddr struct {
+		Host string
+		Port string
+	}
+	discovery := make(map[string]svcAddr)
+	result := &DeployResult{
+		App:      mf.Name,
+		Status:   "running",
+		Services: make(map[string]DeployServiceInfo),
+	}
+
+	for _, svcName := range order {
+		t, ok := tasks[svcName]
+		if !ok {
+			continue
+		}
+
+		// Inject discovery env vars from already-deployed dependencies.
+		svc := mf.Services[svcName]
+		for _, dep := range svc.DependsOn {
+			if addr, found := discovery[dep]; found {
+				prefix := manifest.ServiceEnvKey(dep)
+				t.Env = append(t.Env, fmt.Sprintf("%s_HOST=%s", prefix, addr.Host))
+				t.Env = append(t.Env, fmt.Sprintf("%s_PORT=%s", prefix, addr.Port))
+			}
+		}
+
+		// Persist the task in Pending state.
+		createCtx, createCancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := m.Store.CreateTask(createCtx, t, ""); err != nil {
+			createCancel()
+			result.Status = "partial"
+			log.Printf("Manager %s: failed to create task for service %s: %v", m.ID, svcName, err)
+			break
+		}
+		createCancel()
+
+		// Record in app.
+		app.ServiceTasks[svcName] = t.ID.String()
+		updateCtx, updateCancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = m.Store.UpdateApp(updateCtx, app)
+		updateCancel()
+
+		// Wait for the task to reach Running state.
+		if err := m.waitForTaskRunning(ctx, t.ID, 120*time.Second); err != nil {
+			log.Printf("Manager %s: service %s did not reach Running: %v", m.ID, svcName, err)
+			result.Status = "partial"
+			result.Services[svcName] = DeployServiceInfo{TaskID: t.ID.String(), WorkerID: "", Address: "pending"}
+			continue
+		}
+
+		// Resolve the worker address and mapped port.
+		host, port, workerID := m.resolveServiceAddress(ctx, t.ID, svc.Ports)
+		discovery[svcName] = svcAddr{Host: host, Port: port}
+		result.Services[svcName] = DeployServiceInfo{
+			TaskID:   t.ID.String(),
+			WorkerID: workerID,
+			Address:  fmt.Sprintf("%s:%s", host, port),
+		}
+
+		log.Printf("Manager %s: service %s deployed at %s:%s on worker %s", m.ID, svcName, host, port, workerID)
+	}
+
+	if result.Status == "running" {
+		app.Status = "running"
+	} else {
+		app.Status = result.Status
+	}
+	finalCtx, finalCancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = m.Store.UpdateApp(finalCtx, app)
+	finalCancel()
+
+	return result, nil
+}
+
+// waitForTaskRunning polls the store until the task reaches Running state or
+// the timeout elapses.
+func (m *Manager) waitForTaskRunning(ctx context.Context, taskID uuid.UUID, timeout time.Duration) error {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline:
+			return fmt.Errorf("timeout waiting for task %s to become Running", taskID)
+		case <-ticker.C:
+			checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			t, _, err := m.Store.GetTask(checkCtx, taskID)
+			cancel()
+			if err != nil {
+				continue
+			}
+			if t.State == task.Running {
+				return nil
+			}
+			if t.State == task.Failed {
+				return fmt.Errorf("task %s failed", taskID)
+			}
+		}
+	}
+}
+
+// resolveServiceAddress returns the worker's IP and the first mapped host port
+// for the given task.
+func (m *Manager) resolveServiceAddress(ctx context.Context, taskID uuid.UUID, declaredPorts map[string]string) (host string, port string, workerID string) {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	t, wID, err := m.Store.GetTask(checkCtx, taskID)
+	cancel()
+	if err != nil {
+		return "unknown", "0", ""
+	}
+	workerID = wID
+
+	// Extract host IP from worker address (format: "ip:port").
+	if workerID != "" {
+		parts := strings.SplitN(workerID, ":", 2)
+		host = parts[0]
+	}
+	if host == "" {
+		host = "unknown"
+	}
+
+	// Try to get the actual mapped host port from HostPorts (set by worker
+	// after container inspection). Fall back to declared port binding.
+	if t != nil && t.HostPorts != nil {
+		for _, bindings := range t.HostPorts {
+			if len(bindings) > 0 && bindings[0].HostPort != "" {
+				port = bindings[0].HostPort
+				return
+			}
+		}
+	}
+
+	// Fallback: use the first declared port binding value.
+	for _, hp := range declaredPorts {
+		port = hp
+		return
+	}
+
+	port = "0"
+	return
+}
+
+// TeardownApp stops all services in an app in reverse topological order and
+// removes the app record.
+func (m *Manager) TeardownApp(ctx context.Context, appName string) error {
+	if m.Store == nil {
+		return errors.New("store not configured")
+	}
+
+	getCtx, getCancel := context.WithTimeout(ctx, 5*time.Second)
+	app, err := m.Store.GetApp(getCtx, appName)
+	getCancel()
+	if err != nil {
+		return err
+	}
+
+	app.Status = "stopping"
+	updateCtx, updateCancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = m.Store.UpdateApp(updateCtx, app)
+	updateCancel()
+
+	// Try to get topological order for reverse teardown.
+	agCtx, agCancel := context.WithTimeout(ctx, 5*time.Second)
+	ag, agErr := m.Store.GetAppGroup(agCtx, appName)
+	agCancel()
+
+	var stopOrder []string
+	if agErr == nil {
+		order, err := ag.TopologicalOrder()
+		if err == nil {
+			// Reverse the order: stop dependents first.
+			for i := len(order) - 1; i >= 0; i-- {
+				stopOrder = append(stopOrder, order[i])
+			}
+		}
+	}
+
+	// If we couldn't get topo order, just iterate the map.
+	if len(stopOrder) == 0 {
+		for svcName := range app.ServiceTasks {
+			stopOrder = append(stopOrder, svcName)
+		}
+	}
+
+	for _, svcName := range stopOrder {
+		taskIDStr, ok := app.ServiceTasks[svcName]
+		if !ok {
+			continue
+		}
+
+		tID, err := uuid.Parse(taskIDStr)
+		if err != nil {
+			continue
+		}
+
+		stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, workerID, err := m.Store.GetTask(stopCtx, tID)
+		stopCancel()
+		if err != nil {
+			log.Printf("Manager %s: teardown: could not find task %s for service %s: %v", m.ID, taskIDStr, svcName, err)
+			continue
+		}
+
+		if workerID != "" {
+			m.stopTask(workerID, taskIDStr)
+		}
+		log.Printf("Manager %s: teardown: stopped service %s (task %s)", m.ID, svcName, taskIDStr)
+	}
+
+	app.Status = "stopped"
+	delCtx, delCancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = m.Store.DeleteApp(delCtx, appName)
+	delCancel()
+
+	return nil
+}
+
 func (a *Api) initRouter() {
 	a.Router = chi.NewRouter()
 	a.Router.Get("/status", a.StatusHandler)
@@ -1545,6 +1940,14 @@ func (a *Api) initRouter() {
 		})
 	})
 	a.Router.Get("/nodes", a.GetNodesHandler)
+	a.Router.Route("/apps", func(r chi.Router) {
+		r.Post("/", a.DeployAppHandler)
+		r.Get("/", a.ListAppsHandler)
+		r.Route("/{appName}", func(r chi.Router) {
+			r.Get("/", a.GetAppHandler)
+			r.Delete("/", a.DeleteAppHandler)
+		})
+	})
 }
 
 func (a *Api) Start() {
