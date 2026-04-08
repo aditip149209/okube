@@ -1560,7 +1560,7 @@ func (a *Api) DeployAppHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := a.Manager.DeployApp(r.Context(), m)
+	result, err := a.Manager.DeployApp(context.Background(), m)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrResponse{HTTPStatusCode: http.StatusInternalServerError, Message: fmt.Sprintf("deploy failed: %v", err)})

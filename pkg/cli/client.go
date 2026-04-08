@@ -29,7 +29,7 @@ func NewClient(endpoints []string) *Client {
 	return &Client{
 		Endpoints: endpoints,
 		HTTPClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 10 * time.Minute,
 			// Do NOT follow redirects automatically – we handle 307 ourselves
 			// so we can re-send the request body.
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
