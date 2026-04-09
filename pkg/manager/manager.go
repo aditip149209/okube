@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -2020,8 +2021,39 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 		return errors.New(msg)
 	}
 
-	worker := strings.Split(workerID, ":")
-	url := fmt.Sprintf("http://%s:%s%s", worker[0], *hostPort, t.HealthCheck)
+	// Look up the worker's address from the store. The workerID may be a
+	// human-readable name (e.g. "worker-abc123") rather than a host:port
+	// pair, so we resolve the registered address instead of parsing the ID.
+	workerHost := ""
+	wCtx, wCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	workers, wErr := m.Store.ListWorkers(wCtx)
+	wCancel()
+	if wErr == nil {
+		for _, w := range workers {
+			if w.ID == workerID && w.Address != "" {
+				// Extract the host portion from the worker's registered address.
+				host, _, splitErr := net.SplitHostPort(w.Address)
+				if splitErr == nil && host != "" {
+					workerHost = host
+				}
+				break
+			}
+		}
+	}
+	if workerHost == "" {
+		// Fallback: try parsing workerID directly for backwards compatibility
+		// with workers registered via --workers flag where ID == address.
+		host, _, splitErr := net.SplitHostPort(workerID)
+		if splitErr == nil && host != "" {
+			workerHost = host
+		} else {
+			msg := fmt.Sprintf("Cannot determine host for worker %s assigned to task %s", workerID, t.ID)
+			log.Println(msg)
+			return errors.New(msg)
+		}
+	}
+
+	url := fmt.Sprintf("http://%s:%s%s", workerHost, *hostPort, t.HealthCheck)
 
 	log.Printf("Calling health check for task %s: %s\n", t.ID, url)
 
