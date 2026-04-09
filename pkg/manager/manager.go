@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -2029,10 +2030,12 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 	wCancel()
 	if wErr == nil {
 		for _, w := range workers {
-			if w.ID == workerID {
+			if w.ID == workerID && w.Address != "" {
 				// Extract the host portion from the worker's registered address.
-				parts := strings.Split(w.Address, ":")
-				workerHost = parts[0]
+				host, _, splitErr := net.SplitHostPort(w.Address)
+				if splitErr == nil && host != "" {
+					workerHost = host
+				}
 				break
 			}
 		}
@@ -2040,8 +2043,14 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 	if workerHost == "" {
 		// Fallback: try parsing workerID directly for backwards compatibility
 		// with workers registered via --workers flag where ID == address.
-		parts := strings.Split(workerID, ":")
-		workerHost = parts[0]
+		host, _, splitErr := net.SplitHostPort(workerID)
+		if splitErr == nil && host != "" {
+			workerHost = host
+		} else {
+			msg := fmt.Sprintf("Cannot determine host for worker %s assigned to task %s", workerID, t.ID)
+			log.Println(msg)
+			return errors.New(msg)
+		}
 	}
 
 	url := fmt.Sprintf("http://%s:%s%s", workerHost, *hostPort, t.HealthCheck)
