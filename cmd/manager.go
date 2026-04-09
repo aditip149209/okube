@@ -8,6 +8,7 @@ import (
 
 	"github.com/aditip149209/okube/pkg/manager"
 	"github.com/aditip149209/okube/pkg/store"
+	"github.com/aditip149209/okube/pkg/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -28,6 +29,7 @@ for high availability.`,
 		topologyProbeMode, _ := cmd.Flags().GetString("topology-probe-mode")
 		topologyProbeInterval, _ := cmd.Flags().GetDuration("topology-probe-interval")
 		topologyProbeSampleSize, _ := cmd.Flags().GetInt("topology-probe-sample-size")
+		advertiseAddress, _ := cmd.Flags().GetString("advertise-address")
 
 		endpoints := strings.Split(etcdEndpoints, ",")
 		etcdStore, err := store.NewEtcdStore(store.EtcdConfig{
@@ -48,7 +50,25 @@ for high availability.`,
 			}
 		}
 
-		advertiseAddr := fmt.Sprintf("%s:%d", host, port)
+		// Determine the address other nodes use to reach this manager.
+		// When binding to 0.0.0.0 (all interfaces), auto-detect the LAN
+		// IP so that workers and other managers receive a routable address
+		// instead of the non-routable wildcard.
+		advertiseIP := advertiseAddress
+		if advertiseIP == "" {
+			advertiseIP = host
+			if host == "0.0.0.0" || host == "" {
+				detected, err := utils.GetLANIP()
+				if err != nil {
+					log.Printf("Warning: could not auto-detect LAN IP, falling back to host flag: %v", err)
+					advertiseIP = host
+				} else {
+					advertiseIP = detected
+				}
+			}
+		}
+		advertiseAddr := fmt.Sprintf("%s:%d", advertiseIP, port)
+		log.Printf("Manager advertise address: %s", advertiseAddr)
 		m := manager.NewWithConfig(manager.Config{
 			Workers:                 workerList,
 			SchedulerType:           schedulerType,
@@ -82,4 +102,5 @@ func init() {
 	managerCmd.Flags().String("etcd-endpoints", "localhost:2379", "Comma-separated etcd endpoints")
 	managerCmd.Flags().StringP("workers", "w", "", "Comma-separated initial worker addresses (host:port)")
 	managerCmd.Flags().String("id", "", "Manager ID (defaults to hostname or random UUID)")
+	managerCmd.Flags().String("advertise-address", "", "IP address to advertise to workers and other managers (auto-detected if empty)")
 }
